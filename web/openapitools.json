@@ -1,0 +1,25 @@
+{
+  "$schema": "./node_modules/@openapitools/openapi-generator-cli/config.schema.json",
+  "spaces": 2,
+  "generator-cli": {
+    "version": "7.10.0",
+    "storageDir": "node_modules/.openapi-generator",
+    "generators": {
+      "vaultdoc-typescript-angular": {
+        "generatorName": "typescript-angular",
+        "inputSpec": "../openapi/vaultdoc.yaml",
+        "output": "src/app/core/api/generated",
+        "additionalProperties": {
+          "ngVersion": "18.2.0",
+          "providedIn": "root",
+          "withInterfaces": true,
+          "stringEnums": true,
+          "supportsES6": true,
+          "useSingleRequestParameter": true,
+          "fileNaming": "kebab-case",
+          "modelPropertyNaming": "original"
+        }
+      }
+    }
+  }
+}

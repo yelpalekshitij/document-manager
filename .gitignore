@@ -1,0 +1,94 @@
+# ---- Gradle / Java ----
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+!**/src/main/**/build/
+!**/src/test/**/build/
+out/
+bin/
+*.class
+.kotlin/
+
+# ---- IDE ----
+.idea/modules.xml
+.idea/jarRepositories.xml
+.idea/compiler.xml
+.idea/libraries/
+.idea/workspace.xml
+.idea/tasks.xml
+.idea/dictionaries/
+.idea/shelf/
+*.iws
+*.iml
+*.ipr
+.vscode/
+.fleet/
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+# ---- Node / Angular ----
+node_modules/
+dist/
+.angular/
+*.tsbuildinfo
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- Flutter / Dart ----
+.dart_tool/
+.flutter-plugins
+.flutter-plugins-dependencies
+.packages
+.pub-cache/
+.pub/
+pubspec.lock
+
+# ---- Android ----
+mobile/android/.gradle/
+mobile/android/local.properties
+mobile/android/key.properties
+mobile/android/**/gradle-wrapper.jar
+*.jks
+*.keystore
+
+# ---- iOS (future) ----
+mobile/ios/Pods/
+mobile/ios/.symlinks/
+mobile/ios/Flutter/Flutter.framework
+mobile/ios/Flutter/Flutter.podspec
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+
+# ---- Env / secrets ----
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+!**/test/**/*.pem
+
+# ---- Logs ----
+*.log
+logs/
+
+# ---- Docker volumes (if mounted locally) ----
+infra/.data/
+
+# ---- Generated API clients (regenerated from openapi/) ----
+web/src/app/core/api/generated/
+mobile/api/
+mobile/lib/core/api/generated/
+
+# Build-runner artifacts
+.dart_tool/build/
+
+# Claude Code local settings
+.claude/settings.local.json

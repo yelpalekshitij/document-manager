@@ -1,0 +1,54 @@
+name: vaultdoc_mobile
+description: VaultDoc — privacy-first document intelligence platform (mobile client).
+publish_to: 'none'
+version: 0.1.0+1
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+  flutter: ">=3.24.0"
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # State management
+  flutter_riverpod: ^2.6.1
+
+  # Routing
+  go_router: ^14.6.2
+
+  # Networking
+  dio: ^5.7.0
+
+  # Secure storage + biometrics (Phase 1.1a auth foundations)
+  flutter_secure_storage: ^9.2.2
+  local_auth: ^2.3.0
+
+  # QR code widget for 2FA setup screen
+  qr_flutter: ^4.1.0
+
+  # Generated OpenAPI client. The `api/` directory is produced by
+  # `dart run build_runner build` from openapi_config.dart. It's
+  # gitignored — run codegen once before the first `flutter pub get`.
+  vaultdoc_api:
+    path: api
+
+  # Built models the generated dart-dio client uses at runtime.
+  built_value: ^8.9.2
+  built_collection: ^5.1.1
+
+  # Material 3 icons
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^5.0.0
+
+  # OpenAPI codegen. Build_runner is the standard Dart codegen driver.
+  openapi_generator: ^6.0.0
+  openapi_generator_annotations: ^6.0.0
+  build_runner: ^2.4.13
+
+flutter:
+  uses-material-design: true

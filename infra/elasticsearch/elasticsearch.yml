@@ -1,0 +1,13 @@
+cluster.name: vaultdoc-dev
+node.name: vaultdoc-es-1
+network.host: 0.0.0.0
+http.port: 9200
+discovery.type: single-node
+
+xpack.security.enabled: false
+xpack.security.http.ssl.enabled: false
+xpack.security.transport.ssl.enabled: false
+
+# Dev convenience: disable disk watermark so a near-full laptop disk doesn't
+# turn indices read-only.
+cluster.routing.allocation.disk.threshold_enabled: false

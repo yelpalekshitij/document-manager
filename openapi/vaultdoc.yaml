@@ -1,0 +1,1494 @@
+openapi: 3.1.0
+info:
+  title: VaultDoc API
+  version: 0.1.0-SNAPSHOT
+  description: |
+    The VaultDoc API is the single source of truth for both clients
+    (Angular web app, Flutter mobile app). Breaking changes require a
+    new version path.
+
+    See CLAUDE.md for the broader project brief.
+  contact:
+    name: VaultDoc
+    url: https://vaultdoc.app
+  license:
+    name: AGPL-3.0
+    url: https://www.gnu.org/licenses/agpl-3.0.txt
+
+servers:
+  - url: http://localhost:8080
+    description: Local dev (backend bootRun)
+  - url: https://api.vaultdoc.app
+    description: Production (placeholder)
+
+tags:
+  - name: System
+    description: Health, version, runtime probes
+  - name: Auth
+    description: Account registration, sign-in, tokens, session
+  - name: TwoFactor
+    description: TOTP 2FA setup, verification, and backup-code management
+  - name: Passkey
+    description: WebAuthn passkey enrollment and sign-in ceremonies
+  - name: Documents
+    description: Upload, list, view, and delete documents
+  - name: Folders
+    description: Folder tree CRUD; system folders are seeded on first use
+  - name: Search
+    description: Full-text search across the user's documents
+
+security:
+  - bearerAuth: []
+
+paths:
+  /api/v1/health:
+    get:
+      tags: [System]
+      operationId: getHealth
+      summary: Liveness + dependency health
+      description: |
+        Returns the overall service status plus the status of every
+        critical dependency: Postgres, Redis, Elasticsearch, S3.
+        Use this for both readiness probes and human dashboards.
+      security: []
+      responses:
+        "200":
+          description: Service is up; individual components may still be DOWN — check the body.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+              examples:
+                allUp:
+                  summary: Everything healthy
+                  value:
+                    status: UP
+                    components:
+                      db: UP
+                      redis: UP
+                      elasticsearch: UP
+                      s3: UP
+
+  /api/v1/auth/register:
+    post:
+      tags: [Auth]
+      operationId: register
+      summary: Create a new account and queue a verification email
+      description: |
+        The account is created with status `PENDING_VERIFICATION`. The user must
+        click the link in the verification email (see `/auth/verify-email`)
+        before being able to sign in. No auth session is issued by this call.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Account created — verification email queued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RegistrationResponse"
+        "400":
+          description: Validation failure
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: Email already in use
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      operationId: login
+      summary: Exchange credentials for a token pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: |
+            Authenticated, or a 2FA challenge is required. Check the response body:
+            if it has `accessToken` the session is established;
+            if it has `twoFactorToken`, the client must call `/auth/2fa/verify`.
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/AuthResponse"
+                  - $ref: "#/components/schemas/TwoFactorChallengeResponse"
+                discriminator:
+                  propertyName: type
+        "401":
+          description: Invalid credentials
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "403":
+          description: Account not yet verified (`type=https://vaultdoc.app/problems/unverified-account`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/verify-email:
+    post:
+      tags: [Auth]
+      operationId: verifyEmail
+      summary: Consume a verification token and sign the user in
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/VerifyEmailRequest"
+      responses:
+        "200":
+          description: Email verified — account activated and session issued
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Token unknown, expired, or already used
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/resend-verification:
+    post:
+      tags: [Auth]
+      operationId: resendVerification
+      summary: Send a fresh verification email
+      description: |
+        Rate-limited to one request per 60 seconds per email address. The
+        endpoint always responds in constant time and does not leak whether
+        the email exists.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResendVerificationRequest"
+      responses:
+        "204":
+          description: Acknowledged (email sent if the account exists and is unverified)
+        "429":
+          description: Too many requests (`type=https://vaultdoc.app/problems/verification-rate-limited`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/forgot-password:
+    post:
+      tags: [Auth]
+      operationId: forgotPassword
+      summary: Request a password-reset email
+      description: |
+        Always responds 204 regardless of whether the email is registered —
+        no enumeration of accounts. Rate-limited to one request per 60 seconds
+        per email address.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ForgotPasswordRequest"
+      responses:
+        "204":
+          description: Request acknowledged
+        "429":
+          description: Too many requests (`type=https://vaultdoc.app/problems/reset-rate-limited`)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/reset-password:
+    post:
+      tags: [Auth]
+      operationId: resetPassword
+      summary: Set a new password using a reset token from the email link
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResetPasswordRequest"
+      responses:
+        "204":
+          description: Password changed — all existing sessions revoked
+        "400":
+          description: Token unknown, expired, or already used
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/refresh:
+    post:
+      tags: [Auth]
+      operationId: refresh
+      summary: Rotate a refresh token into a new token pair
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "200":
+          description: New token pair
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "401":
+          description: Refresh token invalid, expired, or reused
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      operationId: logout
+      summary: Invalidate the current refresh token
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshRequest"
+      responses:
+        "204":
+          description: Session terminated
+
+  /api/v1/auth/me:
+    get:
+      tags: [Auth]
+      operationId: getCurrentUser
+      summary: Return the authenticated user's profile
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/MeResponse"
+        "401":
+          description: Missing or invalid token
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/2fa/setup/begin:
+    post:
+      tags: [TwoFactor]
+      operationId: begin2faSetup
+      summary: Generate a new TOTP secret and return the otpauth URI for QR display
+      responses:
+        "200":
+          description: Setup started — scan the QR then call /setup/finish to activate
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TwoFactorSetupResponse"
+        "409":
+          description: 2FA is already enabled
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/2fa/setup/finish:
+    post:
+      tags: [TwoFactor]
+      operationId: finish2faSetup
+      summary: Verify the first code from the authenticator app and activate 2FA
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TwoFactorCodeRequest"
+      responses:
+        "200":
+          description: 2FA activated — backup codes shown once, store them safely
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupCodesResponse"
+        "400":
+          description: Invalid TOTP code
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/2fa/verify:
+    post:
+      tags: [TwoFactor]
+      operationId: verify2fa
+      summary: Complete sign-in by verifying a TOTP code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TwoFactorVerifyRequest"
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Invalid or expired token / code
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/2fa/backup:
+    post:
+      tags: [TwoFactor]
+      operationId: verify2faBackup
+      summary: Complete sign-in using a backup code
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TwoFactorBackupRequest"
+      responses:
+        "200":
+          description: Authenticated (backup code consumed)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Invalid token, unknown backup code, or code already used
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/2fa/backup-codes:
+    get:
+      tags: [TwoFactor]
+      operationId: getBackupCodesStatus
+      summary: How many backup codes remain (never exposes the raw codes)
+      responses:
+        "200":
+          description: Backup code counts
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupCodesStatusResponse"
+
+  /api/v1/auth/2fa/backup-codes/regenerate:
+    post:
+      tags: [TwoFactor]
+      operationId: regenerateBackupCodes
+      summary: Revoke all existing backup codes and generate 10 fresh ones
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TwoFactorCodeRequest"
+      responses:
+        "200":
+          description: New backup codes (shown once)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BackupCodesResponse"
+        "400":
+          description: Invalid TOTP code
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/2fa:
+    delete:
+      tags: [TwoFactor]
+      operationId: disable2fa
+      summary: Disable 2FA after verifying a current TOTP code
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TwoFactorCodeRequest"
+      responses:
+        "204":
+          description: 2FA disabled
+        "400":
+          description: Invalid TOTP code
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: 2FA is not enabled for this account
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/passkey/register/begin:
+    post:
+      tags: [Passkey]
+      operationId: beginPasskeyRegistration
+      summary: Start a passkey registration ceremony for the signed-in user
+      description: |
+        Returns a `PublicKeyCredentialCreationOptions` object the browser passes
+        to `navigator.credentials.create()`, plus a `challengeId` the client
+        echoes back in the finish call. The challenge is single-use and expires
+        in 5 minutes.
+      responses:
+        "200":
+          description: Options ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasskeyRegistrationOptions"
+
+  /api/v1/auth/passkey/register/finish:
+    post:
+      tags: [Passkey]
+      operationId: finishPasskeyRegistration
+      summary: Verify the authenticator's attestation and persist the credential
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PasskeyRegistrationRequest"
+      responses:
+        "201":
+          description: Credential registered
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasskeySummary"
+        "400":
+          description: Bad attestation, expired challenge, or invalid request
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/passkey/signin/begin:
+    post:
+      tags: [Passkey]
+      operationId: beginPasskeySignin
+      summary: Start a passkey assertion ceremony (no credentials required)
+      description: |
+        Returns a `PublicKeyCredentialRequestOptions` object suitable for
+        `navigator.credentials.get()` with discoverable credentials. The user
+        does not need to identify themselves — the credential the browser
+        returns contains the user handle.
+      security: []
+      responses:
+        "200":
+          description: Options ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasskeySigninOptions"
+
+  /api/v1/auth/passkey/signin/finish:
+    post:
+      tags: [Passkey]
+      operationId: finishPasskeySignin
+      summary: Verify the assertion and issue an auth session
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PasskeySigninRequest"
+      responses:
+        "200":
+          description: Authenticated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AuthResponse"
+        "400":
+          description: Bad assertion or expired challenge
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/auth/passkey:
+    get:
+      tags: [Passkey]
+      operationId: listPasskeys
+      summary: List the signed-in user's registered passkeys
+      responses:
+        "200":
+          description: Credential list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PasskeyList"
+
+  /api/v1/auth/passkey/{id}:
+    delete:
+      tags: [Passkey]
+      operationId: deletePasskey
+      summary: Remove a passkey from the signed-in user's account
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Removed
+        "404":
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/documents/initiate-upload:
+    post:
+      tags: [Documents]
+      operationId: initiateUpload
+      summary: Reserve a document row and return a presigned PUT URL
+      description: |
+        Two-step upload. Call this first to receive a presigned S3/MinIO URL,
+        PUT the bytes to that URL with the `Content-Type` matching `mimeType`,
+        then call `/documents/finalize` to flip the document to READY.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/InitiateUploadRequest"
+      responses:
+        "201":
+          description: Upload reserved
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/InitiateUploadResponse"
+        "400":
+          description: Validation, MIME, or size error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/documents/finalize:
+    post:
+      tags: [Documents]
+      operationId: finalizeUpload
+      summary: Confirm the upload and transition the document to READY
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/FinalizeUploadRequest"
+      responses:
+        "200":
+          description: Document finalized
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentDetail"
+        "409":
+          description: Size mismatch, missing upload, or already finalized
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/documents:
+    get:
+      tags: [Documents]
+      operationId: listDocuments
+      summary: List documents for the current user (latest first)
+      parameters:
+        - in: query
+          name: folderId
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 0
+        - in: query
+          name: pageSize
+          schema:
+            type: integer
+            default: 50
+      responses:
+        "200":
+          description: Document list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentListResponse"
+
+  /api/v1/documents/{id}:
+    get:
+      tags: [Documents]
+      operationId: getDocument
+      summary: Fetch a single document by id
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Document detail
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentDetail"
+        "404":
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      tags: [Documents]
+      operationId: deleteDocument
+      summary: Soft-delete a document and remove its blob + index entry
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/documents/{id}/download:
+    get:
+      tags: [Documents]
+      operationId: getDocumentDownload
+      summary: Return a short-lived presigned GET URL for the blob
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: Presigned URL
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentDownloadResponse"
+        "404":
+          description: Not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/folders:
+    get:
+      tags: [Folders]
+      operationId: listFolders
+      summary: List the user's folder tree (system folders seeded on first call)
+      responses:
+        "200":
+          description: Folder tree
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FolderTreeResponse"
+    post:
+      tags: [Folders]
+      operationId: createFolder
+      summary: Create a new folder
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateFolderRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FolderNode"
+        "404":
+          description: Parent folder not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/folders/{id}:
+    patch:
+      tags: [Folders]
+      operationId: updateFolder
+      summary: Rename, move, or recolor a folder
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateFolderRequest"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FolderNode"
+        "404":
+          description: Folder not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      tags: [Folders]
+      operationId: deleteFolder
+      summary: Delete a folder (descendant folders and document folder refs cascade)
+      parameters:
+        - in: path
+          name: id
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Folder not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/search:
+    get:
+      tags: [Search]
+      operationId: searchDocuments
+      summary: Full-text + filter search across the user's documents
+      parameters:
+        - in: query
+          name: q
+          schema:
+            type: string
+        - in: query
+          name: folderId
+          schema:
+            type: string
+            format: uuid
+        - in: query
+          name: page
+          schema:
+            type: integer
+            default: 0
+        - in: query
+          name: pageSize
+          schema:
+            type: integer
+            default: 25
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    HealthResponse:
+      type: object
+      required: [status, components]
+      properties:
+        status:
+          type: string
+          enum: [UP, DEGRADED, DOWN]
+          description: Overall rollup. DEGRADED means non-critical components are down.
+        components:
+          type: object
+          additionalProperties:
+            type: string
+            enum: [UP, DOWN, UNKNOWN]
+          example:
+            db: UP
+            redis: UP
+            elasticsearch: UP
+            s3: UP
+
+    RegisterRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 320
+        password:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 256
+          description: NIST 800-63B — minimum 12 chars, no composition rules.
+        displayName:
+          type: string
+          maxLength: 200
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+        password:
+          type: string
+          format: password
+
+    RefreshRequest:
+      type: object
+      required: [refreshToken]
+      properties:
+        refreshToken:
+          type: string
+
+    VerifyEmailRequest:
+      type: object
+      required: [token]
+      properties:
+        token:
+          type: string
+          description: Opaque token from the verification email.
+
+    ResendVerificationRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    RegistrationResponse:
+      type: object
+      required: [user, verificationRequired]
+      properties:
+        user:
+          $ref: "#/components/schemas/MeResponse"
+        verificationRequired:
+          type: boolean
+          description: True when the account must be verified before sign-in.
+          example: true
+
+    AuthResponse:
+      type: object
+      required: [accessToken, refreshToken, expiresInSeconds, user]
+      properties:
+        accessToken:
+          type: string
+          description: JWT, HS256.
+        refreshToken:
+          type: string
+          description: Opaque random token. Rotates on every refresh.
+        expiresInSeconds:
+          type: integer
+          format: int32
+          example: 3600
+        user:
+          $ref: "#/components/schemas/MeResponse"
+
+    MeResponse:
+      type: object
+      required: [id, email, status, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        email:
+          type: string
+          format: email
+        displayName:
+          type: string
+        status:
+          type: string
+          enum: [ACTIVE, LOCKED, PENDING_VERIFICATION]
+        createdAt:
+          type: string
+          format: date-time
+
+    TwoFactorChallengeResponse:
+      type: object
+      required: [twoFactorToken]
+      properties:
+        twoFactorToken:
+          type: string
+          description: |
+            Short-lived opaque token proving the first factor (password) passed.
+            POST it alongside a TOTP code to `/auth/2fa/verify`, or alongside
+            a backup code to `/auth/2fa/backup`. Expires in 10 minutes.
+
+    TwoFactorSetupResponse:
+      type: object
+      required: [otpauthUri, accountName]
+      properties:
+        otpauthUri:
+          type: string
+          description: |
+            Standard `otpauth://totp/…` URI. Render as a QR code on the client.
+            The secret is embedded in the URI so it is never transmitted separately.
+          example: "otpauth://totp/VaultDoc:k@example.com?secret=JBSWY3DPEHPK3PXP&issuer=VaultDoc"
+        accountName:
+          type: string
+          description: The label shown in the authenticator app (e.g. "k@example.com").
+
+    TwoFactorCodeRequest:
+      type: object
+      required: [code]
+      properties:
+        code:
+          type: string
+          pattern: "^[0-9]{6}$"
+          description: 6-digit TOTP code from the authenticator app.
+
+    TwoFactorVerifyRequest:
+      type: object
+      required: [twoFactorToken, code]
+      properties:
+        twoFactorToken:
+          type: string
+        code:
+          type: string
+          pattern: "^[0-9]{6}$"
+
+    TwoFactorBackupRequest:
+      type: object
+      required: [twoFactorToken, backupCode]
+      properties:
+        twoFactorToken:
+          type: string
+        backupCode:
+          type: string
+          description: One of the 10 single-use backup codes (format XXX-XXX-XXX).
+
+    BackupCodesResponse:
+      type: object
+      required: [codes]
+      properties:
+        codes:
+          type: array
+          items:
+            type: string
+          description: |
+            Exactly 10 plaintext backup codes shown once.
+            Store them securely — they cannot be retrieved again.
+          example: ["A3F-K92-P77", "B8X-Z01-Q44"]
+
+    BackupCodesStatusResponse:
+      type: object
+      required: [remaining, total]
+      properties:
+        remaining:
+          type: integer
+          description: How many backup codes have NOT yet been used.
+        total:
+          type: integer
+          description: Total codes issued in the current generation.
+          example: 10
+
+    PasskeyRegistrationOptions:
+      type: object
+      required: [challengeId, publicKey]
+      properties:
+        challengeId:
+          type: string
+          format: uuid
+          description: Echoes back in the finish call. Server uses it to recover the challenge.
+        publicKey:
+          description: |
+            Opaque WebAuthn `PublicKeyCredentialCreationOptions`. Pass to
+            `navigator.credentials.create({ publicKey })` after base64url decoding
+            byte fields (challenge, user.id, excludeCredentials[].id).
+          type: object
+          additionalProperties: true
+
+    PasskeySigninOptions:
+      type: object
+      required: [challengeId, publicKey]
+      properties:
+        challengeId:
+          type: string
+          format: uuid
+        publicKey:
+          description: |
+            Opaque WebAuthn `PublicKeyCredentialRequestOptions`. Pass to
+            `navigator.credentials.get({ publicKey })`. May be empty when
+            relying on discoverable credentials (the default for VaultDoc).
+          type: object
+          additionalProperties: true
+
+    ForgotPasswordRequest:
+      type: object
+      required: [email]
+      properties:
+        email:
+          type: string
+          format: email
+
+    ResetPasswordRequest:
+      type: object
+      required: [token, newPassword]
+      properties:
+        token:
+          type: string
+          description: Opaque token from the password-reset email link.
+        newPassword:
+          type: string
+          format: password
+          minLength: 12
+          maxLength: 256
+          description: NIST 800-63B — minimum 12 chars, no composition rules.
+
+    PasskeyRegistrationRequest:
+      type: object
+      required: [challengeId, credential]
+      properties:
+        challengeId:
+          type: string
+          format: uuid
+        label:
+          type: string
+          maxLength: 200
+          description: |
+            Human-readable name shown in the user's passkey list, e.g.
+            "MacBook Touch ID". If omitted, the server picks a default.
+        credential:
+          description: |
+            The JSON-serialized `PublicKeyCredential` returned by
+            `navigator.credentials.create()`. Pre-serialize byte fields
+            (rawId, response.attestationObject, response.clientDataJSON)
+            as base64url strings.
+          type: object
+          additionalProperties: true
+
+    PasskeySigninRequest:
+      type: object
+      required: [challengeId, assertion]
+      properties:
+        challengeId:
+          type: string
+          format: uuid
+        assertion:
+          description: |
+            The JSON-serialized `PublicKeyCredential` returned by
+            `navigator.credentials.get()`. Base64url-encode byte fields
+            (rawId, response.authenticatorData, response.clientDataJSON,
+            response.signature, response.userHandle).
+          type: object
+          additionalProperties: true
+
+    PasskeySummary:
+      type: object
+      required: [id, label, transports, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        label:
+          type: string
+        aaguid:
+          type: string
+          format: uuid
+          description: Authenticator vendor identifier; may be omitted by some platforms.
+        transports:
+          type: array
+          items:
+            type: string
+            enum: [internal, usb, nfc, ble, hybrid]
+        createdAt:
+          type: string
+          format: date-time
+        lastUsedAt:
+          type: string
+          format: date-time
+          description: Null until the credential is used to sign in.
+
+    PasskeyList:
+      type: object
+      required: [passkeys]
+      properties:
+        passkeys:
+          type: array
+          items:
+            $ref: "#/components/schemas/PasskeySummary"
+
+    InitiateUploadRequest:
+      type: object
+      required: [filename, mimeType, sizeBytes, sha256]
+      properties:
+        filename:
+          type: string
+          maxLength: 500
+        mimeType:
+          type: string
+          maxLength: 120
+        sizeBytes:
+          type: integer
+          format: int64
+          minimum: 1
+        sha256:
+          type: string
+          pattern: "^[a-fA-F0-9]{64}$"
+        folderId:
+          type: string
+          format: uuid
+
+    InitiateUploadResponse:
+      type: object
+      required: [documentId, storageKey, uploadUrl, expiresInSeconds]
+      properties:
+        documentId:
+          type: string
+          format: uuid
+        storageKey:
+          type: string
+          description: Opaque key; clients do not interpret it.
+        uploadUrl:
+          type: string
+          format: uri
+          description: Presigned PUT URL. PUT the bytes with Content-Type matching mimeType.
+        expiresInSeconds:
+          type: integer
+          format: int64
+
+    FinalizeUploadRequest:
+      type: object
+      required: [documentId]
+      properties:
+        documentId:
+          type: string
+          format: uuid
+
+    DocumentStatus:
+      type: string
+      enum: [PENDING, READY, FAILED, DELETED]
+
+    OcrStatus:
+      type: string
+      enum: [PENDING, PROCESSING, DONE, FAILED, SKIPPED]
+      description: |
+        Lifecycle of OCR text extraction for a document. Distinct from
+        `DocumentStatus` (which tracks the upload). A document is READY long
+        before OCR finishes.
+
+    DocumentSummary:
+      type: object
+      required: [id, filename, mimeType, sizeBytes, status, uploadedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        folderId:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+          format: int64
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        documentType:
+          type: string
+        uploadedAt:
+          type: string
+          format: date-time
+        ocrStatus:
+          $ref: "#/components/schemas/OcrStatus"
+
+    DocumentDetail:
+      type: object
+      required: [id, filename, mimeType, sizeBytes, sha256, status, uploadedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        folderId:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+        status:
+          $ref: "#/components/schemas/DocumentStatus"
+        documentType:
+          type: string
+        issuedAt:
+          type: string
+          format: date
+        expiresAt:
+          type: string
+          format: date
+        uploadedAt:
+          type: string
+          format: date-time
+        finalizedAt:
+          type: string
+          format: date-time
+        ocrStatus:
+          $ref: "#/components/schemas/OcrStatus"
+        ocrText:
+          type: string
+          description: Extracted text capped at ~2 MB; the search index has the full version.
+        ocrPageCount:
+          type: integer
+        ocrCompletedAt:
+          type: string
+          format: date-time
+        ocrFailureReason:
+          type: string
+
+    DocumentListResponse:
+      type: object
+      required: [items, page, pageSize, totalCount]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/DocumentSummary"
+        page:
+          type: integer
+        pageSize:
+          type: integer
+        totalCount:
+          type: integer
+          format: int64
+
+    DocumentDownloadResponse:
+      type: object
+      required: [downloadUrl, expiresInSeconds]
+      properties:
+        downloadUrl:
+          type: string
+          format: uri
+        expiresInSeconds:
+          type: integer
+          format: int64
+
+    FolderNode:
+      type: object
+      required: [id, name, sortOrder, system, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        parentId:
+          type: string
+          format: uuid
+        name:
+          type: string
+        color:
+          type: string
+        icon:
+          type: string
+        sortOrder:
+          type: integer
+        system:
+          type: boolean
+        createdAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+
+    FolderTreeResponse:
+      type: object
+      required: [folders]
+      properties:
+        folders:
+          type: array
+          items:
+            $ref: "#/components/schemas/FolderNode"
+
+    CreateFolderRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        parentId:
+          type: string
+          format: uuid
+        color:
+          type: string
+          maxLength: 16
+        icon:
+          type: string
+          maxLength: 64
+
+    UpdateFolderRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          maxLength: 200
+        parentId:
+          type: string
+          format: uuid
+        color:
+          type: string
+          maxLength: 16
+        icon:
+          type: string
+          maxLength: 64
+
+    SearchHit:
+      type: object
+      required: [documentId, filename, mimeType, sizeBytes, uploadedAt, score]
+      properties:
+        documentId:
+          type: string
+          format: uuid
+        filename:
+          type: string
+        mimeType:
+          type: string
+        sizeBytes:
+          type: integer
+          format: int64
+        folderId:
+          type: string
+          format: uuid
+        folderPath:
+          type: string
+        documentType:
+          type: string
+        uploadedAt:
+          type: string
+          format: date-time
+        score:
+          type: number
+          format: double
+
+    SearchResponse:
+      type: object
+      required: [items, totalCount, page, pageSize]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchHit"
+        totalCount:
+          type: integer
+          format: int64
+        page:
+          type: integer
+        pageSize:
+          type: integer
+
+    Problem:
+      description: RFC 7807 Problem Details for HTTP APIs.
+      type: object
+      required: [type, title, status]
+      properties:
+        type:
+          type: string
+          format: uri
+          example: about:blank
+        title:
+          type: string
+          example: Not Found
+        status:
+          type: integer
+          example: 404
+        detail:
+          type: string
+        instance:
+          type: string
+          format: uri
+        traceId:
+          type: string
+          description: OpenTelemetry trace ID for cross-system debugging.
