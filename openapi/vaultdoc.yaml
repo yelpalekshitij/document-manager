@@ -36,6 +36,11 @@ tags:
     description: Folder tree CRUD; system folders are seeded on first use
   - name: Search
     description: Full-text search across the user's documents
+  - name: Tags
+    description: |
+      User-owned labels: CRUD, assignment to documents, and filtering. Names are
+      unique per user case-insensitively. No tags are seeded — the default
+      folders already carry the starter taxonomy.
 
 security:
   - bearerAuth: []
@@ -663,6 +668,7 @@ paths:
           schema:
             type: integer
             default: 50
+        - $ref: "#/components/parameters/TagIdsFilter"
       responses:
         "200":
           description: Document list
@@ -670,6 +676,12 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/DocumentListResponse"
+        "400":
+          description: Invalid filter (e.g. more than 20 tag ids, or a non-UUID id)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
   /api/v1/documents/{id}:
     get:
@@ -856,6 +868,7 @@ paths:
           schema:
             type: integer
             default: 25
+        - $ref: "#/components/parameters/TagIdsFilter"
       responses:
         "200":
           description: Search results
@@ -863,6 +876,186 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/SearchResponse"
+        "400":
+          description: Invalid filter (e.g. more than 20 tag ids, or a non-UUID id)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/tags:
+    get:
+      tags: [Tags]
+      operationId: listTags
+      summary: List the user's tags (sorted by name) with non-deleted document counts
+      responses:
+        "200":
+          description: Tag list (empty for a new user — nothing is seeded)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TagListResponse"
+    post:
+      tags: [Tags]
+      operationId: createTag
+      summary: Create a tag
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTagRequest"
+      responses:
+        "201":
+          description: Created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tag"
+        "400":
+          description: Invalid name or colour
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: Name already used by another tag (case-insensitive), or tag limit reached
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/tags/{id}:
+    patch:
+      tags: [Tags]
+      operationId: updateTag
+      summary: Rename and/or recolor a tag
+      description: |
+        Absent fields are left unchanged; `color: ""` clears the colour.
+        A rename re-indexes every document carrying the tag.
+      parameters:
+        - $ref: "#/components/parameters/TagIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpdateTagRequest"
+      responses:
+        "200":
+          description: Updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Tag"
+        "400":
+          description: Invalid name or colour
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Tag not found (or owned by another user)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "409":
+          description: New name collides with another tag (case-insensitive)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      tags: [Tags]
+      operationId: deleteTag
+      summary: Delete a tag, detaching it from every document
+      parameters:
+        - $ref: "#/components/parameters/TagIdPath"
+      responses:
+        "204":
+          description: Deleted
+        "404":
+          description: Tag not found (or owned by another user)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/documents/{id}/tags:
+    put:
+      tags: [Tags]
+      operationId: setDocumentTags
+      summary: Replace a document's tags with exactly the given set
+      parameters:
+        - $ref: "#/components/parameters/DocumentIdPath"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetDocumentTagsRequest"
+      responses:
+        "200":
+          description: The document's resulting tags
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentTagsResponse"
+        "400":
+          description: More than 50 ids, or a null id
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+        "404":
+          description: Document or one of the tags not found (or owned by another user)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+
+  /api/v1/documents/{id}/tags/{tagId}:
+    put:
+      tags: [Tags]
+      operationId: addDocumentTag
+      summary: Attach one tag to a document (idempotent)
+      parameters:
+        - $ref: "#/components/parameters/DocumentIdPath"
+        - $ref: "#/components/parameters/TagIdInDocumentPath"
+      responses:
+        "200":
+          description: The document's resulting tags
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentTagsResponse"
+        "404":
+          description: Document or tag not found (or owned by another user)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
+    delete:
+      tags: [Tags]
+      operationId: removeDocumentTag
+      summary: Detach one tag from a document (idempotent)
+      parameters:
+        - $ref: "#/components/parameters/DocumentIdPath"
+        - $ref: "#/components/parameters/TagIdInDocumentPath"
+      responses:
+        "200":
+          description: The document's resulting tags
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DocumentTagsResponse"
+        "404":
+          description: Document or tag not found (or owned by another user)
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/Problem"
 
 components:
   securitySchemes:
@@ -870,6 +1063,45 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
+
+  parameters:
+    TagIdsFilter:
+      in: query
+      name: tagIds
+      description: |
+        Tag filter with AND semantics — a document must carry every listed tag.
+        Repeat the parameter per id. Duplicates are ignored; at most 20 ids.
+        Ids that are unknown or belong to another user match nothing (empty
+        result, not 404).
+      style: form
+      explode: true
+      schema:
+        type: array
+        maxItems: 20
+        items:
+          type: string
+          format: uuid
+    TagIdPath:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        format: uuid
+    DocumentIdPath:
+      in: path
+      name: id
+      required: true
+      schema:
+        type: string
+        format: uuid
+    TagIdInDocumentPath:
+      in: path
+      name: tagId
+      required: true
+      schema:
+        type: string
+        format: uuid
 
   schemas:
     HealthResponse:
@@ -1256,7 +1488,7 @@ components:
 
     DocumentSummary:
       type: object
-      required: [id, filename, mimeType, sizeBytes, status, uploadedAt]
+      required: [id, filename, mimeType, sizeBytes, status, uploadedAt, tags]
       properties:
         id:
           type: string
@@ -1280,10 +1512,15 @@ components:
           format: date-time
         ocrStatus:
           $ref: "#/components/schemas/OcrStatus"
+        tags:
+          type: array
+          description: The document's tags, sorted by name.
+          items:
+            $ref: "#/components/schemas/TagRef"
 
     DocumentDetail:
       type: object
-      required: [id, filename, mimeType, sizeBytes, sha256, status, uploadedAt]
+      required: [id, filename, mimeType, sizeBytes, sha256, status, uploadedAt, tags]
       properties:
         id:
           type: string
@@ -1328,6 +1565,11 @@ components:
           format: date-time
         ocrFailureReason:
           type: string
+        tags:
+          type: array
+          description: The document's tags, sorted by name.
+          items:
+            $ref: "#/components/schemas/TagRef"
 
     DocumentListResponse:
       type: object
@@ -1427,7 +1669,7 @@ components:
 
     SearchHit:
       type: object
-      required: [documentId, filename, mimeType, sizeBytes, uploadedAt, score]
+      required: [documentId, filename, mimeType, sizeBytes, uploadedAt, score, tagIds]
       properties:
         documentId:
           type: string
@@ -1452,6 +1694,12 @@ components:
         score:
           type: number
           format: double
+        tagIds:
+          type: array
+          description: Ids of the document's tags as indexed; resolve names/colours via `listTags`.
+          items:
+            type: string
+            format: uuid
 
     SearchResponse:
       type: object
@@ -1468,6 +1716,100 @@ components:
           type: integer
         pageSize:
           type: integer
+
+    TagRef:
+      type: object
+      description: A tag as embedded in a document payload.
+      required: [id, name]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        color:
+          type: string
+          description: "`#rrggbb`, lowercase. Absent when the tag has no colour."
+
+    Tag:
+      type: object
+      required: [id, name, documentCount, createdAt]
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string
+        color:
+          type: string
+          description: "`#rrggbb`, lowercase. Absent when the tag has no colour."
+        documentCount:
+          type: integer
+          format: int64
+          description: Number of non-deleted documents carrying the tag.
+        createdAt:
+          type: string
+          format: date-time
+
+    TagListResponse:
+      type: object
+      required: [tags]
+      properties:
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/Tag"
+
+    CreateTagRequest:
+      type: object
+      required: [name]
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          description: |
+            Trimmed, whitespace runs collapsed, NFC-normalised; 1–64 characters
+            (code points) after that; no control characters.
+        color:
+          type: string
+          pattern: "^#[0-9a-fA-F]{6}$"
+
+    UpdateTagRequest:
+      type: object
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 64
+        color:
+          type: string
+          description: "`#rrggbb` to set, empty string to clear, absent to keep."
+          pattern: "^(#[0-9a-fA-F]{6})?$"
+
+    SetDocumentTagsRequest:
+      type: object
+      required: [tagIds]
+      properties:
+        tagIds:
+          type: array
+          maxItems: 50
+          description: The complete new tag set; duplicates are ignored, `[]` clears.
+          items:
+            type: string
+            format: uuid
+
+    DocumentTagsResponse:
+      type: object
+      required: [documentId, tags]
+      properties:
+        documentId:
+          type: string
+          format: uuid
+        tags:
+          type: array
+          items:
+            $ref: "#/components/schemas/TagRef"
 
     Problem:
       description: RFC 7807 Problem Details for HTTP APIs.

@@ -648,6 +648,67 @@ docker manifest inspect pgvector/pgvector:pg17            # all 3 new datastore 
 
 ---
 
+## Phase 1.4 (tags slice) — Tag CRUD + Tag-as-Filter  *(2026-10-24)*
+
+**Goal:** Close the "Tag CRUD UI + tag-as-filter" item deferred from Phase 1.2. V7 already created `tags` + `document_tags` and the ES mapping already had a `tags` keyword; nothing used them. Built strictly test-first against a case matrix: [`docs/phase-1.4/tags-cases.md`](./docs/phase-1.4/tags-cases.md).
+
+### Scope
+
+| In | Deferred |
+|---|---|
+| OpenAPI `Tags` tag: list (with counts), create, rename/recolor, delete, set/add/remove on a document; `tagIds` filter (AND) on `GET /documents` + `GET /search`; `tags` on `DocumentSummary`/`DocumentDetail`, `tagIds` on `SearchHit`. Catalog `TagService`; gateway `TagController` + `DocumentTagController` + `TagIndexSynchronizer`; ES `tagIds` field + `updateTags`. Web: tag store, sidebar filter, manager dialog, chips in list/viewer/search hits. JaCoCo in the convention plugin. | Mobile tag UI + Dart client regen (Flutter not installed). Bulk tagging from the list (multi-select). Case-insensitive *free-text* match on tag names (needs a `lowercase` normalizer → index v2). Tag hierarchy/nesting. |
+
+### Decisions locked
+
+- **No migration.** V7's `tags.color VARCHAR(16)` and `UNIQUE (user_id, LOWER(name))` already fit; `document_tags` cascades on both FKs, so tag delete detaches for free.
+- **No seeded tags.** The 8 default *folders* already are the CLAUDE.md starter taxonomy; seeding the same words as tags duplicates it. The lazy-seeder pattern (1.2 precedent 4) stays available if product wants starter tags.
+- **Name rules** (`TagInput`, pure + unit-tested): NFC, collapse whitespace runs (Unicode-aware — `strip()` misses NBSP), trim, reject control chars, 1–64 **code points** (Postgres `VARCHAR(64)` semantics; a `@Size` would count UTF-16 units and reject 64 emoji). Colour `#rrggbb`, stored lowercase; PATCH `""` clears, absent keeps.
+- **Uniqueness:** case-insensitive pre-check with the *same* `LOWER()` as the index, then `saveAndFlush`; a `DataIntegrityViolationException` (lost race) becomes `409 tag-name-conflict`. Renaming a tag to a different case of its own name is allowed. 500 tags/user cap → `409 tag-limit-reached`.
+- **Tenant scoping:** a foreign tag or document is indistinguishable from a missing one (`404 tag-not-found` / `document-not-found`). Soft-deleted documents can't be tagged and don't count.
+- **Unknown/foreign tagId in a *filter* → empty result (200), not 404.** It leaks nothing and keeps bookmarked filters working after a tag is deleted. Filter ids are deduped (else the SQL `HAVING count = n` never matches) and capped at 20 (`400 invalid-tag`).
+- **Idempotent assignment:** attach is a native `INSERT … ON CONFLICT DO NOTHING` (concurrent adds can't hit the PK); detach of a non-attached tag is a 200 no-op. Set/add/remove all return the document's resulting tags (200), so clients patch rows without refetching. No event when nothing changed.
+- **ES tag fields are owned by `SearchService.updateTags`** (bulk partial update; missing docs skipped, never upserted as stubs). `index()` became a **merge-upsert that never writes tag fields** and writes explicit nulls for clearable fields. Without this the OCR consumer (which re-indexes with `tags = []`) silently wiped tags — the `ocr` module was off-limits, so the fix had to live in `search`. Pre-1.4 indexes get `tagIds` via an in-place `putMapping` on first use.
+- **Re-index trigger:** catalog publishes `DocumentTagsChangedEvent` (assignment change, rename, delete); `TagIndexSynchronizer` in the gateway (only module that sees both catalog and search) handles it AFTER_COMMIT, and also `DocumentFinalizedEvent` so tags added while PENDING reach ES. Failures are logged, not propagated. Recolor doesn't re-index (colour isn't indexed).
+- **New ProblemDetails:** `tag-not-found` 404, `tag-name-conflict` 409, `tag-limit-reached` 409, `invalid-tag` 400, plus generic `malformed-request` 400 (unreadable JSON) and `validation` 400 for type mismatches (non-UUID path/query) — those were 400s with empty bodies or 500s before.
+
+### Tests added: 163 backend (115 → 278)
+
+- Catalog: `TagInputTest` (30 incl. parameterised), `TagServiceImplTest` (44), `DocumentServiceImplTest` (16), `DefaultFolderSeederTest` (2), `TagDomainTest` (3), `CatalogAutoConfigurationTest` (1).
+- Search: `ElasticsearchSearchServiceTagIT` (12, Testcontainers ES 9).
+- Gateway: `TagApiContractTest` (31, `@WebMvcTest` with the real `SecurityConfig`), `TagIndexSynchronizerTest` (7), `TagFlowIT` (17, full Testcontainers stack incl. concurrency and the OCR-reindex race).
+- Web specs (5 files): tags store, documents store (tag parts), filter, manager, chips — **written, not yet executed** (see Verification).
+
+### Bugs hit & fixed
+
+- **OCR re-index wiped tags** (latent since 1.3; ES `index` is a full replace and the consumer passes `List.of()`). Proven by mutation: restoring the replace fails `reindex_preservesTags` + `ocrReindex_preservesTags`.
+- **`@MockitoBean` + suite-wide concurrent JUnit mode** interleaved stubbing between methods of the contract test (spurious 401s, `WrongTypeOfReturnValue`). Fix: `@Execution(SAME_THREAD)` on the class, same as the ITs.
+- **`tsconfig.app.json` included `src/**/*.ts` with `types: []`.** Harmless while the repo had no specs; the first `*.spec.ts` would have broken `ng build`. Now excludes `*.spec.ts` / `*.spec-helpers.ts`.
+
+### Architectural precedents locked
+
+1. **One owner per search-index field group.** A stage that doesn't know a field must not write it; partial updates + merge-upserts, never full replaces from multiple writers.
+2. **Cross-module reactions live in the gateway** when they need two modules that must not import each other (catalog ↛ search). In-process event + AFTER_COMMIT listener, same shape as the 1.3 stream forwarder.
+3. **Domain input rules are pure classes** (`TagInput`) tested in isolation; DTOs only carry structural constraints (`@NotNull`, list `@Size`).
+4. **Coverage is reported per module** (`jacocoTestReport` finalizes every `test`). Per-module numbers don't credit cross-module IT coverage, so modules exercised mainly via gateway ITs need their own unit tests to reach the 80% bar.
+
+### Verification
+
+```bash
+cd backend && ./gradlew test     # 278 green; JaCoCo XML/HTML in */build/reports/jacoco/test/
+#   line coverage — catalog 90.5%, search 82.6%, api-gateway 89.1%
+
+cd ../web && npm install && npm test && npm run build   # NOT run in this phase — npm was blocked
+#   in the build environment. Also confirm the generated client's call style: openapitools.json sets
+#   useSingleRequestParameter=true, but documents.store.ts (1.2) and the new tag calls use positional args.
+
+# Manual loop: sign in → /documents → sidebar "Tags · Manage" → create "Tax" (Green) →
+# add it to a row via the chip select → click "Tax" in the sidebar (aria-pressed) → list filters,
+# heading announces "Tagged: Tax" → type in search → results respect folder + tag + query →
+# rename "Tax" → chips update, search by new name hits → delete with in-app confirm → chip gone.
+```
+
+---
+
 ## Test count cumulative
 
 | Phase | Total tests |
@@ -662,3 +723,4 @@ docker manifest inspect pgvector/pgvector:pg17            # all 3 new datastore 
 | 1.2 | 108 backend (87 + 7 IngestServiceImplTest + 8 FolderServiceImplTest + 4 DocumentFlowIT + 2 housekeeping) + web documents feature |
 | 1.3 | 115 backend (108 + 4 PdfBoxOcrServiceTest + 3 OcrPipelineIT) + web OCR badge + extracted-text panel |
 | 1.3.5 | 115 backend (unchanged — platform upgrade, all green on Java 25 / Spring Boot 4.1 / Jackson 3 / ES 9) |
+| 1.4 (tags) | 278 backend (115 + 163 tag slice incl. catalog characterisation tests) + 5 web spec files (unexecuted) |

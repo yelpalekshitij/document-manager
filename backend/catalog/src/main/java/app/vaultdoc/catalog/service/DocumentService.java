@@ -1,6 +1,7 @@
 package app.vaultdoc.catalog.service;
 
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import org.springframework.data.domain.Page;
@@ -15,7 +16,16 @@ public interface DocumentService {
 
     Document findByIdForUser(UUID userId, UUID documentId);
 
-    Page<Document> list(UUID userId, UUID folderId, Pageable pageable);
+    default Page<Document> list(UUID userId, UUID folderId, Pageable pageable) {
+        return list(userId, folderId, Set.of(), pageable);
+    }
+
+    /**
+     * Non-deleted documents, newest first. {@code tagIds} (AND semantics) is
+     * expected pre-normalised via {@link TagInput#normalizeFilter}; an empty set
+     * means "no tag filter". Ids the user doesn't own simply match nothing.
+     */
+    Page<Document> list(UUID userId, UUID folderId, Set<UUID> tagIds, Pageable pageable);
 
     List<Document> recentReady(UUID userId, int limit);
 

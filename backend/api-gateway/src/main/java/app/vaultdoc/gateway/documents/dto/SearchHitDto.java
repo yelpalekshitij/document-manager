@@ -1,6 +1,7 @@
 package app.vaultdoc.gateway.documents.dto;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 import app.vaultdoc.search.service.SearchHit;
@@ -14,7 +15,8 @@ public record SearchHitDto(
         String folderPath,
         String documentType,
         Instant uploadedAt,
-        double score) {
+        double score,
+        List<UUID> tagIds) {
 
     public static SearchHitDto from(SearchHit h) {
         return new SearchHitDto(
@@ -26,6 +28,7 @@ public record SearchHitDto(
                 h.folderPath(),
                 h.documentType(),
                 h.uploadedAt(),
-                h.score());
+                h.score(),
+                h.tagIds());
     }
 }

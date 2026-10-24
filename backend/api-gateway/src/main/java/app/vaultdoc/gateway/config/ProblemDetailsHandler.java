@@ -20,6 +20,10 @@ import app.vaultdoc.core.auth.twofa.TwoFactorAlreadyEnabledException;
 import app.vaultdoc.core.auth.twofa.TwoFactorNotEnabledException;
 import app.vaultdoc.catalog.service.DocumentNotFoundException;
 import app.vaultdoc.catalog.service.FolderNotFoundException;
+import app.vaultdoc.catalog.service.InvalidTagException;
+import app.vaultdoc.catalog.service.TagLimitExceededException;
+import app.vaultdoc.catalog.service.TagNameConflictException;
+import app.vaultdoc.catalog.service.TagNotFoundException;
 import app.vaultdoc.ingest.service.DocumentAlreadyFinalizedException;
 import app.vaultdoc.ingest.service.MimeNotAllowedException;
 import app.vaultdoc.ingest.service.SizeExceededException;
@@ -31,9 +35,11 @@ import org.springframework.http.HttpHeaders;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ProblemDetail;
 import org.springframework.http.ResponseEntity;
+import org.springframework.http.converter.HttpMessageNotReadableException;
 import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
+import org.springframework.web.method.annotation.MethodArgumentTypeMismatchException;
 
 @RestControllerAdvice
 public class ProblemDetailsHandler {
@@ -189,6 +195,47 @@ public class ProblemDetailsHandler {
     ResponseEntity<ProblemDetail> handleVirus(VirusDetectedException e, HttpServletRequest req) {
         return problem(HttpStatus.UNPROCESSABLE_CONTENT, type("virus-detected"),
                 "Virus detected", e.getMessage(), req);
+    }
+
+    // ── Tags ───────────────────────────────────────────────────────────────
+
+    @ExceptionHandler(TagNotFoundException.class)
+    ResponseEntity<ProblemDetail> handleTagNotFound(TagNotFoundException e, HttpServletRequest req) {
+        return problem(HttpStatus.NOT_FOUND, type("tag-not-found"),
+                "Tag not found", e.getMessage(), req);
+    }
+
+    @ExceptionHandler(TagNameConflictException.class)
+    ResponseEntity<ProblemDetail> handleTagConflict(TagNameConflictException e, HttpServletRequest req) {
+        return problem(HttpStatus.CONFLICT, type("tag-name-conflict"),
+                "Tag name already in use", e.getMessage(), req);
+    }
+
+    @ExceptionHandler(TagLimitExceededException.class)
+    ResponseEntity<ProblemDetail> handleTagLimit(TagLimitExceededException e, HttpServletRequest req) {
+        return problem(HttpStatus.CONFLICT, type("tag-limit-reached"),
+                "Tag limit reached", e.getMessage(), req);
+    }
+
+    @ExceptionHandler(InvalidTagException.class)
+    ResponseEntity<ProblemDetail> handleInvalidTag(InvalidTagException e, HttpServletRequest req) {
+        return problem(HttpStatus.BAD_REQUEST, type("invalid-tag"),
+                "Invalid tag", e.getMessage(), req);
+    }
+
+    // ── Request binding ────────────────────────────────────────────────────
+
+    /** A path/query value that doesn't convert (e.g. a non-UUID id) — 400, not a 500. */
+    @ExceptionHandler(MethodArgumentTypeMismatchException.class)
+    ResponseEntity<ProblemDetail> handleTypeMismatch(MethodArgumentTypeMismatchException e, HttpServletRequest req) {
+        return problem(HttpStatus.BAD_REQUEST, type("validation"),
+                "Validation failed", e.getName() + ": invalid value", req);
+    }
+
+    @ExceptionHandler(HttpMessageNotReadableException.class)
+    ResponseEntity<ProblemDetail> handleUnreadable(HttpMessageNotReadableException e, HttpServletRequest req) {
+        return problem(HttpStatus.BAD_REQUEST, type("malformed-request"),
+                "Malformed request body", "The request body is not valid JSON for this endpoint.", req);
     }
 
     @ExceptionHandler(MethodArgumentNotValidException.class)

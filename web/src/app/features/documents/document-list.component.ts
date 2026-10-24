@@ -3,21 +3,27 @@ import { DatePipe, DecimalPipe } from '@angular/common';
 
 import { DocumentsStore } from './documents.store';
 import { DocumentSummary } from '../../core/api/types';
+import { TagChipsComponent } from '../tags/tag-chips.component';
 
 @Component({
   selector: 'vd-document-list',
   standalone: true,
-  imports: [DatePipe, DecimalPipe],
+  imports: [DatePipe, DecimalPipe, TagChipsComponent],
   template: `
     @if (store.loading()) {
       <p class="muted">Loading…</p>
     } @else if (rows().length === 0) {
-      <p class="muted">No documents yet. Drop a PDF or image into the zone above to get started.</p>
+      @if (store.selectedTagIds().length > 0) {
+        <p class="muted">No documents carry all of the selected tags.</p>
+      } @else {
+        <p class="muted">No documents yet. Drop a PDF or image into the zone above to get started.</p>
+      }
     } @else {
       <table>
         <thead>
           <tr>
             <th>Filename</th>
+            <th>Tags</th>
             <th>Type</th>
             <th>OCR</th>
             <th>Size</th>
@@ -29,6 +35,9 @@ import { DocumentSummary } from '../../core/api/types';
           @for (doc of rows(); track doc.id) {
             <tr (click)="opened.emit(doc)">
               <td class="name">{{ doc.filename }}</td>
+              <td class="tags">
+                <vd-tag-chips [documentId]="doc.id" [tags]="doc.tags ?? []" [editable]="true" />
+              </td>
               <td><span class="badge">{{ shortType(doc.mimeType) }}</span></td>
               <td>
                 <span class="ocr" [title]="ocrTooltip(doc.ocrStatus)">{{ ocrIcon(doc.ocrStatus) }}</span>
@@ -56,6 +65,7 @@ import { DocumentSummary } from '../../core/api/types';
       tbody tr { cursor: pointer; }
       tbody tr:hover { background: rgba(255, 255, 255, 0.02); }
       .name { font-weight: 500; }
+      .tags { min-width: 10rem; }
       .badge {
         font-size: 0.72rem;
         color: var(--vd-fg-muted);

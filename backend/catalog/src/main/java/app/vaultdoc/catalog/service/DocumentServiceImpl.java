@@ -1,6 +1,7 @@
 package app.vaultdoc.catalog.service;
 
 import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 import org.springframework.data.domain.Page;
@@ -56,9 +57,12 @@ public class DocumentServiceImpl implements DocumentService {
 
     @Override
     @Transactional(readOnly = true)
-    public Page<Document> list(UUID userId, UUID folderId, Pageable pageable) {
+    public Page<Document> list(UUID userId, UUID folderId, Set<UUID> tagIds, Pageable pageable) {
         seeder.ensureSeeded(userId);
-        return documents.pageByUser(userId, folderId, pageable);
+        if (tagIds == null || tagIds.isEmpty()) {
+            return documents.pageByUser(userId, folderId, pageable);
+        }
+        return documents.pageByUserAndTags(userId, folderId, tagIds, tagIds.size(), pageable);
     }
 
     @Override

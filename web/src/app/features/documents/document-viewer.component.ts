@@ -1,11 +1,13 @@
 import { Component, computed, inject, input, output, signal } from '@angular/core';
 
 import { DocumentsStore } from './documents.store';
-import { DocumentDetail, DocumentSummary } from '../../core/api/types';
+import { DocumentDetail, DocumentSummary, TagRef } from '../../core/api/types';
+import { TagChipsComponent } from '../tags/tag-chips.component';
 
 @Component({
   selector: 'vd-document-viewer',
   standalone: true,
+  imports: [TagChipsComponent],
   template: `
     <div class="overlay" (click)="dismiss($event)">
       <section class="panel" (click)="$event.stopPropagation()">
@@ -13,6 +15,15 @@ import { DocumentDetail, DocumentSummary } from '../../core/api/types';
           <h2>{{ doc()?.filename }}</h2>
           <button type="button" class="close" (click)="close.emit()" aria-label="Close">×</button>
         </header>
+
+        <div class="tag-bar">
+          <vd-tag-chips
+            [documentId]="doc().id"
+            [tags]="currentTags()"
+            [editable]="true"
+            (changed)="localTags.set($event)"
+          />
+        </div>
 
         <div class="preview">
           @if (downloadUrl() && isPdf()) {
@@ -79,6 +90,7 @@ import { DocumentDetail, DocumentSummary } from '../../core/api/types';
         border-bottom: 1px solid var(--vd-border);
       }
       h2 { margin: 0; font-size: 1rem; font-weight: 500; }
+      .tag-bar { padding: 0.5rem 1.25rem; border-bottom: 1px solid var(--vd-border); }
       .close {
         background: transparent; border: none; color: var(--vd-fg);
         font-size: 1.5rem; cursor: pointer; line-height: 1;
@@ -133,6 +145,16 @@ export class DocumentViewerComponent {
   protected readonly downloadUrl = signal<string | null>(null);
   protected readonly error = signal<string | null>(null);
   protected readonly detail = signal<DocumentDetail | null>(null);
+  /** Set from the chips' (changed) output — covers docs opened from search hits, which aren't in the list. */
+  protected readonly localTags = signal<TagRef[] | null>(null);
+  protected readonly currentTags = computed<TagRef[]>(() => {
+    const id = this.doc().id;
+    return this.store.documents().find((d) => d.id === id)?.tags
+      ?? this.localTags()
+      ?? this.detail()?.tags
+      ?? this.doc().tags
+      ?? [];
+  });
 
   protected readonly isPdf = computed(() => this.doc()?.mimeType === 'application/pdf');
   protected readonly isImage = computed(() => (this.doc()?.mimeType ?? '').startsWith('image/'));

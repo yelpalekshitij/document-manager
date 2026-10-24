@@ -1,16 +1,21 @@
 import { Injectable, computed, inject, signal } from '@angular/core';
-import { firstValueFrom } from 'rxjs';
+import { Observable, firstValueFrom } from 'rxjs';
 
-import { DocumentsService, FoldersService, SearchService } from '../../core/api/generated';
+import { DocumentsService, FoldersService, SearchService, TagsService } from '../../core/api/generated';
 import {
   CreateFolderRequest,
   DocumentDetail,
   DocumentSummary,
+  DocumentTagsResponse,
   FolderNode,
   SearchHit,
+  Tag,
+  TagRef,
   UpdateFolderRequest,
+  UpdateTagRequest,
 } from '../../core/api/types';
 import { presignedPut, sha256Hex, UploadProgress, UploadResult } from '../../core/upload/uploader';
+import { TagsStore, tagErrorMessage } from '../tags/tags.store';
 
 export interface UploadingFile {
   id: string;
@@ -27,6 +32,8 @@ export class DocumentsStore {
   private readonly documentsApi = inject(DocumentsService);
   private readonly foldersApi = inject(FoldersService);
   private readonly searchApi = inject(SearchService);
+  private readonly tagsApi = inject(TagsService);
+  private readonly tagsStore = inject(TagsStore);
 
   private readonly _folders = signal<FolderNode[]>([]);
   private readonly _documents = signal<DocumentSummary[]>([]);
@@ -36,6 +43,9 @@ export class DocumentsStore {
   private readonly _loading = signal<boolean>(false);
   private readonly _uploads = signal<UploadingFile[]>([]);
   private readonly _totalCount = signal<number>(0);
+  /** Tag filter (AND semantics), combined with the folder and the search query. */
+  private readonly _selectedTagIds = signal<string[]>([]);
+  private readonly _tagError = signal<string | null>(null);
 
   readonly folders = this._folders.asReadonly();
   readonly documents = this._documents.asReadonly();
@@ -46,6 +56,9 @@ export class DocumentsStore {
   readonly uploads = this._uploads.asReadonly();
   readonly totalCount = this._totalCount.asReadonly();
   readonly searching = computed(() => this._query().trim().length > 0);
+  readonly selectedTagIds = this._selectedTagIds.asReadonly();
+  /** Last tag-assignment / tag-edit failure, shown next to the chips. */
+  readonly tagError = this._tagError.asReadonly();
 
   async loadFolders(): Promise<void> {
     const resp = await firstValueFrom(this.foldersApi.listFolders());
@@ -56,7 +69,9 @@ export class DocumentsStore {
     this._loading.set(true);
     try {
       const folderId = this._selectedFolderId() ?? undefined;
-      const resp = await firstValueFrom(this.documentsApi.listDocuments(folderId, 0, 100));
+      const resp = await firstValueFrom(
+        this.documentsApi.listDocuments(folderId, 0, 100, this.tagFilter()),
+      );
       this._documents.set(resp.items ?? []);
       this._totalCount.set(resp.totalCount ?? 0);
     } finally {
@@ -71,9 +86,99 @@ export class DocumentsStore {
       return;
     }
     const resp = await firstValueFrom(
-      this.searchApi.searchDocuments(q, this._selectedFolderId() ?? undefined, 0, 50),
+      this.searchApi.searchDocuments(q, this._selectedFolderId() ?? undefined, 0, 50, this.tagFilter()),
     );
     this._searchHits.set(resp.items ?? []);
+  }
+
+  // ── Tag filter ───────────────────────────────────────────────────────────
+
+  toggleTag(tagId: string): void {
+    this._selectedTagIds.update((ids) =>
+      ids.includes(tagId) ? ids.filter((id) => id !== tagId) : [...ids, tagId],
+    );
+    this.refreshResults();
+  }
+
+  clearTagFilter(): void {
+    if (this._selectedTagIds().length === 0) return;
+    this._selectedTagIds.set([]);
+    this.refreshResults();
+  }
+
+  // ── Tag assignment ───────────────────────────────────────────────────────
+
+  /** Attach a tag; returns the document's resulting tags, or null on failure. */
+  addTag(documentId: string, tagId: string): Promise<TagRef[] | null> {
+    return this.assign(documentId, this.tagsApi.addDocumentTag(documentId, tagId));
+  }
+
+  /** Detach a tag; returns the document's resulting tags, or null on failure. */
+  removeTag(documentId: string, tagId: string): Promise<TagRef[] | null> {
+    return this.assign(documentId, this.tagsApi.removeDocumentTag(documentId, tagId));
+  }
+
+  clearTagError(): void {
+    this._tagError.set(null);
+  }
+
+  // ── Tag edits that ripple into the document rows ─────────────────────────
+
+  async updateTag(id: string, patch: UpdateTagRequest): Promise<Tag | null> {
+    const updated = await this.tagsStore.update(id, patch);
+    if (updated) {
+      const chip: TagRef = { id: updated.id, name: updated.name, color: updated.color };
+      this.patchTags((tags) => tags.map((t) => (t.id === id ? chip : t)));
+    }
+    return updated;
+  }
+
+  async deleteTag(id: string): Promise<boolean> {
+    const ok = await this.tagsStore.remove(id);
+    if (!ok) return false;
+    this.patchTags((tags) => tags.filter((t) => t.id !== id));
+    if (this._selectedTagIds().includes(id)) {
+      this._selectedTagIds.update((ids) => ids.filter((x) => x !== id));
+      await this.reloadResults();
+    }
+    return true;
+  }
+
+  private async assign(documentId: string, call: Observable<DocumentTagsResponse>): Promise<TagRef[] | null> {
+    this._tagError.set(null);
+    try {
+      const resp = await firstValueFrom(call);
+      const tags = resp.tags ?? [];
+      this._documents.update((rows) => rows.map((d) => (d.id === documentId ? { ...d, tags } : d)));
+      void this.tagsStore.load();   // document counts changed
+      if (this._selectedTagIds().length > 0) {
+        await this.reloadResults();   // the row may no longer match the filter
+      }
+      return tags;
+    } catch (err) {
+      this._tagError.set(tagErrorMessage(err));
+      return null;
+    }
+  }
+
+  private patchTags(fn: (tags: TagRef[]) => TagRef[]): void {
+    this._documents.update((rows) => rows.map((d) => ({ ...d, tags: fn(d.tags ?? []) })));
+  }
+
+  /** `undefined` (no query param at all) rather than `[]` when nothing is selected. */
+  private tagFilter(): string[] | undefined {
+    const ids = this._selectedTagIds();
+    return ids.length > 0 ? [...ids] : undefined;
+  }
+
+  private refreshResults(): void {
+    void this.reloadResults();
+  }
+
+  private async reloadResults(): Promise<void> {
+    const pending: Promise<void>[] = [this.loadDocuments()];
+    if (this.searching()) pending.push(this.runSearch(this._query()));
+    await Promise.all(pending);
   }
 
   selectFolder(folderId: string | null): void {

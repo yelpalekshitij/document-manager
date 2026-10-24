@@ -2,9 +2,11 @@ package app.vaultdoc.gateway.documents.dto;
 
 import java.time.Instant;
 import java.time.LocalDate;
+import java.util.List;
 import java.util.UUID;
 
 import app.vaultdoc.catalog.domain.Document;
+import app.vaultdoc.catalog.domain.Tag;
 
 public record DocumentDetail(
         UUID id,
@@ -23,9 +25,10 @@ public record DocumentDetail(
         String ocrText,
         Integer ocrPageCount,
         Instant ocrCompletedAt,
-        String ocrFailureReason) {
+        String ocrFailureReason,
+        List<TagRefDto> tags) {
 
-    public static DocumentDetail from(Document doc) {
+    public static DocumentDetail from(Document doc, List<Tag> tags) {
         return new DocumentDetail(
                 doc.getId(),
                 doc.getFolderId(),
@@ -43,6 +46,7 @@ public record DocumentDetail(
                 doc.getOcrText(),
                 doc.getOcrPageCount(),
                 doc.getOcrCompletedAt(),
-                doc.getOcrFailureReason());
+                doc.getOcrFailureReason(),
+                TagRefDto.from(tags));
     }
 }

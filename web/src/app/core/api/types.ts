@@ -29,6 +29,13 @@ export {
   UpdateFolderRequest,
   SearchHit,
   SearchResponse,
+  Tag,
+  TagRef,
+  TagListResponse,
+  CreateTagRequest,
+  UpdateTagRequest,
+  SetDocumentTagsRequest,
+  DocumentTagsResponse,
 } from './generated';
 
 export interface ProblemDetails {
@@ -76,3 +83,7 @@ export const PROBLEM_UPLOAD_OBJECT_MISSING =
   'https://vaultdoc.app/problems/upload-object-missing';
 export const PROBLEM_DOCUMENT_NOT_FOUND = 'https://vaultdoc.app/problems/document-not-found';
 export const PROBLEM_FOLDER_NOT_FOUND = 'https://vaultdoc.app/problems/folder-not-found';
+export const PROBLEM_TAG_NOT_FOUND = 'https://vaultdoc.app/problems/tag-not-found';
+export const PROBLEM_TAG_NAME_CONFLICT = 'https://vaultdoc.app/problems/tag-name-conflict';
+export const PROBLEM_TAG_LIMIT_REACHED = 'https://vaultdoc.app/problems/tag-limit-reached';
+export const PROBLEM_INVALID_TAG = 'https://vaultdoc.app/problems/invalid-tag';

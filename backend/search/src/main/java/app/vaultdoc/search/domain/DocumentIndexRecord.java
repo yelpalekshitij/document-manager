@@ -8,6 +8,10 @@ import java.util.UUID;
  * Flattened representation of a Document for the search index. Phase 2 adds
  * {@code ocrText} and an {@code extractedFields} map; today the index covers
  * filename + folder metadata only.
+ *
+ * <p>{@code tags} is ignored by {@code SearchService.index}: since Phase 1.4 the
+ * tag fields are owned by {@code SearchService.updateTags}, so stages that don't
+ * know a document's tags (finalize, OCR) can't overwrite them.
  */
 public record DocumentIndexRecord(
         UUID documentId,
