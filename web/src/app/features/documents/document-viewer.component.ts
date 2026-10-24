@@ -37,17 +37,31 @@ import { DocumentDetail, DocumentSummary } from '../../core/api/types';
             <span class="status">{{ ocrSummaryLabel() }}</span>
           </summary>
           <div class="ocr-body">
-            @if (detail()?.ocrStatus === 'DONE' && detail()?.ocrText) {
-              <pre>{{ detail()?.ocrText }}</pre>
-              @if (detail()?.ocrPageCount) {
-                <p class="muted">{{ detail()?.ocrPageCount }} page(s)</p>
+            @if (detail(); as d) {
+              @if (d.ocrStatus === 'DONE') {
+                @if (d.ocrText) {
+                  <pre>{{ d.ocrText }}</pre>
+                } @else {
+                  <p class="muted">No text was found in this document.</p>
+                }
+                @if (d.ocrPageCount) {
+                  <p class="muted">{{ d.ocrPageCount }} page(s)</p>
+                }
+              } @else if (d.ocrStatus === 'PROCESSING' || d.ocrStatus === 'PENDING') {
+                <p class="muted">Extraction in progress — refresh in a moment.</p>
+              } @else if (d.ocrStatus === 'SKIPPED') {
+                <p class="muted">{{ d.ocrFailureReason ?? 'Text extraction is not available for this file type.' }}</p>
+              } @else if (d.ocrStatus === 'FAILED') {
+                <!-- The reason comes from the server (timeout, missing language pack, oversized image…). Never hide it. -->
+                <p class="error" role="alert">
+                  <strong>Text extraction failed.</strong>
+                  @if (d.ocrFailureReason) {
+                    <span class="reason">{{ d.ocrFailureReason }}</span>
+                  }
+                </p>
               }
-            } @else if (detail()?.ocrStatus === 'PROCESSING' || detail()?.ocrStatus === 'PENDING') {
-              <p class="muted">Extraction in progress — refresh in a moment.</p>
-            } @else if (detail()?.ocrStatus === 'SKIPPED') {
-              <p class="muted">No extractable text for this file type yet (Tesseract for images lands in 1.4).</p>
-            } @else if (detail()?.ocrStatus === 'FAILED') {
-              <p class="error">{{ detail()?.ocrFailureReason ?? 'Extraction failed.' }}</p>
+            } @else if (error()) {
+              <p class="error" role="alert">Couldn't load extraction details: {{ error() }}</p>
             } @else {
               <p class="muted">Loading details…</p>
             }
@@ -92,6 +106,8 @@ import { DocumentDetail, DocumentSummary } from '../../core/api/types';
       }
       .fallback a { color: var(--vd-accent); }
       .error { color: var(--vd-danger); }
+      .ocr-body .error, .ocr-body .muted { padding: 0.5rem 0; text-align: left; }
+      .ocr-body .reason { display: block; margin-top: 0.25rem; font-size: 0.8rem; }
       .ocr-panel {
         border-top: 1px solid var(--vd-border);
         max-height: 35%;
@@ -136,7 +152,11 @@ export class DocumentViewerComponent {
 
   protected readonly isPdf = computed(() => this.doc()?.mimeType === 'application/pdf');
   protected readonly isImage = computed(() => (this.doc()?.mimeType ?? '').startsWith('image/'));
-  protected readonly ocrPanelOpen = computed(() => this.detail()?.ocrStatus === 'DONE');
+  // Open for DONE (show the text) and FAILED (never hide why extraction failed).
+  protected readonly ocrPanelOpen = computed(() => {
+    const status = this.detail()?.ocrStatus;
+    return status === 'DONE' || status === 'FAILED';
+  });
   protected readonly ocrSummaryLabel = computed(() => this.detail()?.ocrStatus ?? '—');
 
   // Plain string binding is fine for our same-origin presigned URLs;

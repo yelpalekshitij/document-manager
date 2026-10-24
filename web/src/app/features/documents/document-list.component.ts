@@ -3,6 +3,7 @@ import { DatePipe, DecimalPipe } from '@angular/common';
 
 import { DocumentsStore } from './documents.store';
 import { DocumentSummary } from '../../core/api/types';
+import { ocrIcon, ocrLabel } from './ocr-status';
 
 @Component({
   selector: 'vd-document-list',
@@ -31,7 +32,12 @@ import { DocumentSummary } from '../../core/api/types';
               <td class="name">{{ doc.filename }}</td>
               <td><span class="badge">{{ shortType(doc.mimeType) }}</span></td>
               <td>
-                <span class="ocr" [title]="ocrTooltip(doc.ocrStatus)">{{ ocrIcon(doc.ocrStatus) }}</span>
+                <span
+                  class="ocr"
+                  role="img"
+                  [attr.aria-label]="ocrLabel(doc.ocrStatus)"
+                  [title]="ocrLabel(doc.ocrStatus)"
+                >{{ ocrIcon(doc.ocrStatus) }}</span>
               </td>
               <td>{{ (doc.sizeBytes / 1024) | number: '1.0-1' }} KB</td>
               <td>{{ doc.uploadedAt | date: 'medium' }}</td>
@@ -94,27 +100,8 @@ export class DocumentListComponent {
     return mime;
   }
 
-  protected ocrIcon(status: string | null | undefined): string {
-    switch (status) {
-      case 'DONE': return '✓';
-      case 'PROCESSING': return '⏳';
-      case 'PENDING': return '⏳';
-      case 'SKIPPED': return '·';
-      case 'FAILED': return '✗';
-      default: return '—';
-    }
-  }
-
-  protected ocrTooltip(status: string | null | undefined): string {
-    switch (status) {
-      case 'DONE': return 'Text extracted and searchable';
-      case 'PROCESSING': return 'OCR in progress';
-      case 'PENDING': return 'Awaiting OCR worker';
-      case 'SKIPPED': return 'OCR skipped (not yet supported for this type)';
-      case 'FAILED': return 'OCR failed — open the doc for the reason';
-      default: return 'OCR status unknown';
-    }
-  }
+  protected readonly ocrIcon = ocrIcon;
+  protected readonly ocrLabel = ocrLabel;
 
   async onDelete(event: MouseEvent, doc: DocumentSummary): Promise<void> {
     event.stopPropagation();
