@@ -1,6 +1,6 @@
 package app.vaultdoc.ocr.config;
 
-import java.time.Duration;
+import java.nio.file.Path;
 
 import jakarta.annotation.PostConstruct;
 import jakarta.annotation.PreDestroy;
@@ -27,8 +27,15 @@ import app.vaultdoc.core.pipeline.stream.StreamNames;
 import app.vaultdoc.core.pipeline.stream.StreamPublisher;
 import app.vaultdoc.core.storage.ObjectStorage;
 import app.vaultdoc.ocr.consumer.UploadFinalizedConsumer;
+import app.vaultdoc.ocr.service.ImageOcrService;
 import app.vaultdoc.ocr.service.OcrService;
 import app.vaultdoc.ocr.service.PdfBoxOcrService;
+import app.vaultdoc.ocr.service.RoutingOcrService;
+import app.vaultdoc.ocr.service.ScannedPdfFallback;
+import app.vaultdoc.ocr.tesseract.CliTesseractRunner;
+import app.vaultdoc.ocr.tesseract.TesseractException;
+import app.vaultdoc.ocr.tesseract.TesseractLanguageResolver;
+import app.vaultdoc.ocr.tesseract.TesseractRunner;
 import app.vaultdoc.search.service.SearchService;
 
 @Configuration
@@ -39,8 +46,56 @@ public class OcrAutoConfiguration {
 
     @Bean
     @ConditionalOnMissingBean
-    OcrService ocrService(ObjectStorage storage, OcrProperties properties) {
-        return new PdfBoxOcrService(storage, properties.extractedTextLimitBytes());
+    TesseractRunner tesseractRunner(OcrProperties properties) {
+        return new CliTesseractRunner(
+                properties.tesseractPath(),
+                properties.tessdataDir() == null ? null : Path.of(properties.tessdataDir()),
+                properties.tesseractTimeout(),
+                tempRoot(properties));
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    TesseractLanguageResolver tesseractLanguageResolver(TesseractRunner runner, OcrProperties properties) {
+        return new TesseractLanguageResolver(runner, properties.languageList());
+    }
+
+    /**
+     * MIME router: PDFs → PDFBox (+ Tesseract for scanned pages), images →
+     * Tesseract, everything else SKIPPED with a reason.
+     */
+    @Bean
+    @ConditionalOnMissingBean
+    OcrService ocrService(
+            ObjectStorage storage,
+            TesseractRunner runner,
+            TesseractLanguageResolver languages,
+            OcrProperties properties) {
+        Path tempRoot = tempRoot(properties);
+        ScannedPdfFallback fallback = properties.pdfOcrFallbackEnabled()
+                ? new ScannedPdfFallback(
+                        runner,
+                        languages,
+                        properties.pdfOcrMaxPages(),
+                        properties.pdfOcrDpi(),
+                        properties.maxImagePixels(),
+                        properties.pdfMinTextCharsPerPage(),
+                        tempRoot)
+                : null;
+        OcrService pdf = new PdfBoxOcrService(storage, properties.extractedTextLimitBytes(), fallback);
+        OcrService image = new ImageOcrService(
+                storage,
+                runner,
+                languages,
+                properties.maxImageBytes(),
+                properties.maxImagePixels(),
+                properties.extractedTextLimitBytes(),
+                tempRoot);
+        return new RoutingOcrService(pdf, image);
+    }
+
+    private static Path tempRoot(OcrProperties properties) {
+        return properties.tempDir() == null ? null : Path.of(properties.tempDir());
     }
 
     @Bean
@@ -101,20 +156,41 @@ public class OcrAutoConfiguration {
      * issues visible during boot.
      */
     @Bean
-    OcrLifecycleLogger ocrLifecycleLogger(OcrProperties properties) {
-        return new OcrLifecycleLogger(properties);
+    OcrLifecycleLogger ocrLifecycleLogger(OcrProperties properties, TesseractLanguageResolver languages) {
+        return new OcrLifecycleLogger(properties, languages);
     }
 
     static class OcrLifecycleLogger {
         private final OcrProperties properties;
-        OcrLifecycleLogger(OcrProperties properties) { this.properties = properties; }
+        private final TesseractLanguageResolver languages;
+
+        OcrLifecycleLogger(OcrProperties properties, TesseractLanguageResolver languages) {
+            this.properties = properties;
+            this.languages = languages;
+        }
 
         @PostConstruct void onInit() {
-            log.info("OCR pipeline initialized: group={} pollTimeout={} batchSize={} extractedTextLimit={}",
+            log.info("OCR pipeline initialized: group={} pollTimeout={} batchSize={} extractedTextLimit={} "
+                            + "tesseract={} languages={} timeout={} pdfFallback={} (maxPages={}, dpi={})",
                     properties.consumerGroup(),
                     properties.pollTimeout(),
                     properties.batchSize(),
-                    properties.extractedTextLimitBytes());
+                    properties.extractedTextLimitBytes(),
+                    properties.tesseractPath(),
+                    properties.languageList(),
+                    properties.tesseractTimeout(),
+                    properties.pdfOcrFallbackEnabled(),
+                    properties.pdfOcrMaxPages(),
+                    properties.pdfOcrDpi());
+            // Probe once at boot so a missing binary / language pack shows up in
+            // the startup log, not only on the first image upload. Never fatal:
+            // PDFs with a text layer still work without tesseract.
+            try {
+                log.info("Tesseract languages in use: {}", languages.resolve());
+            } catch (TesseractException e) {
+                log.warn("Tesseract unavailable at startup — image and scanned-PDF OCR will be marked FAILED: {}",
+                        e.getMessage());
+            }
         }
 
         @PreDestroy void onShutdown() {

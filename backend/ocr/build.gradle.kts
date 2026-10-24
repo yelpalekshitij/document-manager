@@ -13,4 +13,5 @@ dependencies {
     api(libs.spring.boot.starter.data.redis)
 
     testImplementation(libs.spring.boot.starter.test)
+    testImplementation(libs.awaitility)
 }

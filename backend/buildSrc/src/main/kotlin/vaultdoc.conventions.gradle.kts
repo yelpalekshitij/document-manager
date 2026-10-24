@@ -10,7 +10,13 @@ import org.gradle.api.tasks.testing.logging.TestLogEvent
 plugins {
     java
     `java-library`
+    jacoco
     id("io.spring.dependency-management")
+}
+
+jacoco {
+    // 0.8.14 is the first JaCoCo release with official Java 25 class-file support.
+    toolVersion = "0.8.14"
 }
 
 repositories {
@@ -71,4 +77,15 @@ tasks.withType<Test>().configureEach {
     // when they exercise blocking I/O against Testcontainers.
     systemProperty("junit.jupiter.execution.parallel.enabled", "true")
     systemProperty("junit.jupiter.execution.parallel.mode.default", "concurrent")
+    // Line coverage per module (CLAUDE.md quality bar: ≥80% on core modules).
+    // Report lands in build/reports/jacoco/test/ (HTML + XML for CI).
+    finalizedBy(tasks.named("jacocoTestReport"))
+}
+
+tasks.named<JacocoReport>("jacocoTestReport") {
+    dependsOn(tasks.named("test"))
+    reports {
+        xml.required = true
+        html.required = true
+    }
 }

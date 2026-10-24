@@ -1328,6 +1328,11 @@ components:
           format: date-time
         ocrFailureReason:
           type: string
+          description: |
+            Human-readable reason when `ocrStatus` is FAILED (e.g. tesseract
+            timeout, image over the pixel limit, no OCR language installed) or
+            SKIPPED (e.g. unsupported file type). Null otherwise. Safe to show
+            to the document owner.
 
     DocumentListResponse:
       type: object

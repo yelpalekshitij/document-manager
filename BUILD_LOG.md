@@ -648,6 +648,68 @@ docker manifest inspect pgvector/pgvector:pg17            # all 3 new datastore 
 
 ---
 
+## Phase 1.4 — Tesseract OCR for Images + Scanned PDFs  *(2026-10-24)*
+
+**Goal:** Close the Phase 1.3 gap where every image upload ended `SKIPPED` and image-only PDFs came back with empty text. Photos and scans are most of what users upload from a phone — they must be searchable by content.
+
+Built strictly test-first: the case matrix is [`docs/phase-1.4/ocr-cases.md`](./docs/phase-1.4/ocr-cases.md) (one row per behaviour, each naming its test).
+
+### Scope
+
+| In | Deferred |
+|---|---|
+| Tesseract CLI runner, image OCR (JPEG/PNG/TIFF/WebP), per-page scanned-PDF fallback (hybrid PDFs), MIME router, language config with graceful degradation, byte/pixel/page/DPI/timeout limits, `api-gateway` runtime Dockerfile with `eng`+`hin`, JaCoCo in the convention plugin, web OCR failure/skip reason display + badge a11y. | Per-document language auto-detection (CLAUDE.md §14). HEIC (leptonica can't read it — `SKIPPED` with reason; needs a converter). Textract / Doc AI fallback (Phase 2). Concurrency cap on tesseract processes (consumer is single-threaded today). Mobile badge copy (Flutter not installed here; no API change, so the Dart client is unaffected). |
+
+### Decisions locked
+
+- **Tesseract via the CLI (`ProcessBuilder`), not Tess4J/JNA.** A crash, leak or runaway in native Tesseract/Leptonica stays in a child process instead of killing the JVM; timeouts are enforceable by killing the process (descendants first); no `--enable-native-access` / JNA restricted-method warnings on Java 25; no per-platform `libtesseract` lookup (Homebrew arm64 vs Debian paths). Cost is ~50 ms process start per call — irrelevant next to OCR time. Matches CLAUDE.md's "Tesseract 5 (CLI)". The `tess4j` catalog entry stays unused.
+- **`OcrService` stays the abstraction; `RoutingOcrService` is the bean.** It normalises MIME (case, whitespace, `;params`, `image/jpg` alias) and dispatches: PDF → `PdfBoxOcrService` (+ `ScannedPdfFallback`), images → `ImageOcrService`, else `SKIPPED` with a reason. It also turns an engine exception or `null` into `FAILED` — the last guard against silent failure.
+- **Scanned-PDF fallback is per page.** A page whose text layer has < `pdf-min-text-chars-per-page` (25) visible chars is rendered (grayscale, `pdf-ocr-dpi` 300) and OCR'd; OCR text replaces the layer only when longer. Hybrid PDFs (digital cover + scanned annexures) only pay for OCR on scanned pages. At most `pdf-ocr-max-pages` (20) pages per document.
+- **Limits fail loudly, never OOM.** Byte cap (25 MB) before decoding; pixel cap (50 MP) from the image *header* (ImageIO readers, hand-parsed RIFF/VP8/VP8L/VP8X for WebP since the JDK has no WebP reader) and from the PDF page box *before* rendering. All → `FAILED` with a reason.
+- **Languages: `eng+hin` default, degrade gracefully.** `TesseractLanguageResolver` intersects config with `tesseract --list-langs`, logs **one** WARN naming missing packs, continues with the installed subset; only "none installed" is `FAILED`. Successful resolution cached; a failed listing (binary missing) is not, so each document surfaces it. Language tokens must match `[A-Za-z][A-Za-z0-9_]{0,39}` — they become process args. Blank config means the default; all-invalid falls back to `eng`.
+- **Boot-time probe is informational.** Startup logs the languages in use, or a WARN if tesseract is missing — never fatal (text PDFs work without it).
+- **Temp files:** one owner-only scratch dir per job (`vaultdoc.ocr.temp-dir`, default `java.io.tmpdir`), deleted on every path; the runner's stdout/stderr go to files (no pipe-buffer deadlock) in its own scratch dir, also always deleted.
+- **`SKIPPED` carries a reason** in `ocrFailureReason` (the column already existed; no migration, no OpenAPI change). `OcrStatus` names unchanged (`DONE` = completed).
+- **Runtime image:** `backend/api-gateway/Dockerfile` (eclipse-temurin:25-jre-noble + `tesseract-ocr`, `-eng`, `-hin`, non-root, `OCR_TEMP_DIR=/app/ocr-tmp` mode 700). Verified: `tesseract 5.3.4`, `--list-langs` → `eng hin osd`, libwebp present.
+- **JaCoCo 0.8.14** (first with Java 25 support) in `vaultdoc.conventions`; `jacocoTestReport` finalizes every `test` task (XML + HTML).
+
+### What landed
+
+- **`ocr/tesseract`:** `TesseractRunner` (seam), `CliTesseractRunner`, `TesseractLanguageResolver`, `TesseractException` / `TesseractTimeoutException` / `TesseractUnavailableException`.
+- **`ocr/service`:** `RoutingOcrService`, `ImageOcrService`, `ScannedPdfFallback`, `ImageDimensions` (+ `ImageDecodeException`), `TempWorkspace`, `OcrText`; `PdfBoxOcrService` gains the per-page fallback and a friendly password-protected reason.
+- **`ocr/config`:** `OcrProperties` gains 11 knobs (`@With` for tests, out-of-range → default); `OcrAutoConfiguration` wires runner → resolver → engines → router and probes at boot.
+- **`api-gateway`:** `application.yml` `vaultdoc.ocr.*` env-backed keys; `Dockerfile`.
+- **Web:** `ocr-status.ts` (badge copy), list badge gets `role="img"` + `aria-label`; viewer shows FAILED reason in a `role="alert"` (panel auto-opens), SKIPPED reason, "No text was found" for blank scans, and a fetch error instead of "Loading…" forever.
+- **Infra:** `infra/README.md` OCR section (install, env vars, degradation behaviour).
+
+### Tests added: 98 backend (cumulative 213, all green) + 3 web spec files (written first, not yet executed)
+
+- Unit (fake runner / fake `/bin/sh` binaries — no tesseract needed): `RoutingOcrServiceTest` (17), `ImageOcrServiceTest` (20), `PdfBoxOcrServiceTest` (+14 → 18), `ImageDimensionsTest` (4), `CliTesseractRunnerTest` (9: args, exit codes, timeout kills process **and child**, interrupt, missing binary, 1 MB output no-deadlock, scratch cleanup), `TesseractLanguageResolverTest` (6), `OcrPropertiesTest` (11), `OcrAutoConfigurationTest` (4), `UploadFinalizedConsumerTest` (6, characterization).
+- Real engine, `Assumptions`-gated: `TesseractCliIT` (3) — Java2D PNG and image-only PDF read back.
+- `OcrPipelineIT` (+5 → 7): PNG → `DONE` + searchable, scanned PDF → `DONE` via fallback + searchable (both real-engine, gated), corrupt JPEG → `FAILED` + reason, HEIC → `SKIPPED` + reason, OCR text tenant-scoped (other user: 0 hits, 404).
+- Coverage (JaCoCo line): `ocr` **90.3%**, `api-gateway` 85.4%.
+
+### Bugs hit & fixed
+
+- **Logback capture in parallel tests** → `ClassCastException: SubstituteLogger` (SLF4J still initialising when concurrent test classes grab loggers). Fix: the resolver takes an injectable warning sink (`Consumer<String>`, production = `log::warn`) instead of tests scraping Logback.
+- **Timeout test race:** a 500 ms budget could expire before the fake binary wrote its pid under parallel load. 3 s budget + also assert the child `sleep` dies.
+- **PDFBox render width off by one** (612 pt × 100/72f floors to 849): DPI assertion uses ±1 px.
+- **UTF-8 truncation** (pre-existing in 1.3's cap): backing up over continuation bytes *before* the cut could leave a dangling lead byte (→ U+FFFD, can exceed the cap). Now checks the byte *at* the cut.
+
+### Verification
+
+```bash
+cd backend && ./gradlew test            # 213 green; jacoco reports in */build/reports/jacoco/test/
+brew install tesseract tesseract-lang   # or apt-get install tesseract-ocr tesseract-ocr-{eng,hin}
+./gradlew :api-gateway:bootRun          # log: "Tesseract languages in use: [eng, hin]"
+./gradlew :api-gateway:bootJar && docker build -t vaultdoc/api-gateway backend/api-gateway
+cd ../web && npm install && npm test    # web specs (not run in the build environment)
+# Manual: drop a phone photo of a receipt → badge ✓, words searchable; drop a scanned PDF → ✓;
+# drop a .heic → · with "OCR is not supported for image/heic"; uninstall tesseract → ✗ with reason in viewer.
+```
+
+---
+
 ## Test count cumulative
 
 | Phase | Total tests |
@@ -662,3 +724,4 @@ docker manifest inspect pgvector/pgvector:pg17            # all 3 new datastore 
 | 1.2 | 108 backend (87 + 7 IngestServiceImplTest + 8 FolderServiceImplTest + 4 DocumentFlowIT + 2 housekeeping) + web documents feature |
 | 1.3 | 115 backend (108 + 4 PdfBoxOcrServiceTest + 3 OcrPipelineIT) + web OCR badge + extracted-text panel |
 | 1.3.5 | 115 backend (unchanged — platform upgrade, all green on Java 25 / Spring Boot 4.1 / Jackson 3 / ES 9) |
+| 1.4 (OCR) | 213 backend (115 + 98 OCR slice) + 3 web spec files |

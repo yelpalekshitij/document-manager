@@ -93,6 +93,18 @@ vaultdoc:
     batch-size: ${OCR_BATCH_SIZE:10}
     poll-timeout: ${OCR_POLL_TIMEOUT:2s}
     extracted-text-limit-bytes: ${OCR_EXTRACTED_TEXT_LIMIT:2000000}
+    # Tesseract (Phase 1.4). Missing language packs degrade to the installed subset with a WARN.
+    languages: ${OCR_LANGUAGES:eng+hin}
+    tesseract-path: ${TESSERACT_PATH:tesseract}
+    tessdata-dir: ${TESSDATA_DIR:}
+    tesseract-timeout: ${OCR_TESSERACT_TIMEOUT:60s}
+    max-image-bytes: ${OCR_MAX_IMAGE_BYTES:26214400}          # 25 MB
+    max-image-pixels: ${OCR_MAX_IMAGE_PIXELS:50000000}        # 50 MP (also caps rendered PDF pages)
+    pdf-ocr-fallback-enabled: ${OCR_PDF_FALLBACK_ENABLED:true}
+    pdf-ocr-max-pages: ${OCR_PDF_MAX_PAGES:20}
+    pdf-ocr-dpi: ${OCR_PDF_DPI:300}
+    pdf-min-text-chars-per-page: ${OCR_PDF_MIN_TEXT_CHARS:25}
+    temp-dir: ${OCR_TEMP_DIR:}
   web:
     cors:
       allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:4200,http://10.0.2.2:4200}

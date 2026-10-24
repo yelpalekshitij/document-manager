@@ -1,5 +1,10 @@
 package app.vaultdoc.gateway.documents;
 
+import java.awt.Color;
+import java.awt.Font;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
+import java.awt.image.BufferedImage;
 import java.io.ByteArrayOutputStream;
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -8,8 +13,15 @@ import java.net.http.HttpResponse;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.time.Duration;
+import java.util.ArrayList;
 import java.util.HexFormat;
+import java.util.List;
+import java.util.Optional;
 import java.util.UUID;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import javax.imageio.ImageIO;
 
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.ObjectMapper;
@@ -18,6 +30,8 @@ import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
+import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.awaitility.Awaitility;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Execution;
@@ -32,6 +46,7 @@ import org.springframework.test.web.servlet.MvcResult;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
@@ -44,9 +59,14 @@ import app.vaultdoc.gateway.support.RecordingEmailSender;
 @Execution(ExecutionMode.SAME_THREAD)
 class OcrPipelineIT extends DocumentITBase {
 
+    /** Real tesseract, if this host has one. Tests that need it are skipped otherwise. */
+    private static final Optional<String> TESSERACT = locateTesseract();
+
     @DynamicPropertySource
     static void overrideRedisPassword(DynamicPropertyRegistry registry) {
         registry.add("spring.data.redis.password", () -> "");
+        // Gradle daemons don't always inherit the interactive PATH (e.g. /opt/homebrew/bin).
+        TESSERACT.ifPresent(path -> registry.add("vaultdoc.ocr.tesseract-path", () -> path));
     }
 
     @Autowired MockMvc mvc;
@@ -103,24 +123,161 @@ class OcrPipelineIT extends DocumentITBase {
     }
 
     @Test
-    void image_upload_is_marked_skipped_in_phase_1_3() throws Exception {
+    void png_upload_is_ocrd_and_text_is_searchable() throws Exception {
+        assumeTrue(TESSERACT.isPresent(), "tesseract not installed — skipping real-engine IT");
         String token = registerVerifyAndLogin();
-        // Bytes don't actually have to be a valid JPEG since we never invoke an image decoder.
+        byte[] png = png(textImage("INVOICE PAID", 1400, 220));
+
+        String documentId = uploadAndFinalize(token, "receipt.png", "image/png", png);
+
+        JsonNode detail = awaitOcr(documentId, token, "DONE");
+        assertTrue(detail.get("ocrText").asString().contains("INVOICE"),
+                "expected OCR text to contain INVOICE: " + detail);
+        assertEquals(1, detail.get("ocrPageCount").asInt());
+
+        // Searchable by a word that only exists inside the image.
+        mvc.perform(get("/api/v1/search").param("q", "invoice")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].documentId").value(documentId));
+    }
+
+    @Test
+    void scanned_pdf_is_ocrd_via_fallback() throws Exception {
+        assumeTrue(TESSERACT.isPresent(), "tesseract not installed — skipping real-engine IT");
+        String token = registerVerifyAndLogin();
+        byte[] scanned = imageOnlyPdf(textImage("LEASE DEED", 500, 100));
+
+        String documentId = uploadAndFinalize(token, "scan.pdf", "application/pdf", scanned);
+
+        JsonNode detail = awaitOcr(documentId, token, "DONE");
+        assertTrue(detail.get("ocrText").asString().contains("LEASE"),
+                "expected fallback OCR text to contain LEASE: " + detail);
+
+        mvc.perform(get("/api/v1/search").param("q", "lease")
+                        .header("Authorization", "Bearer " + token))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].documentId").value(documentId));
+    }
+
+    @Test
+    void corrupt_image_marks_ocr_failed_with_reason() throws Exception {
+        String token = registerVerifyAndLogin();
+        // A JPEG SOI + APP0 marker and nothing else: the header probe rejects it
+        // before tesseract is ever involved, so this runs without the binary.
         byte[] bytes = new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF, (byte) 0xE0, 0, 16};
 
         String documentId = uploadAndFinalize(token, "scan.jpg", "image/jpeg", bytes);
 
-        Awaitility.await()
-                .atMost(Duration.ofSeconds(15))
-                .pollInterval(Duration.ofMillis(250))
-                .untilAsserted(() -> {
-                    JsonNode detail = getJsonAuth("/api/v1/documents/" + documentId, token);
-                    assertEquals("SKIPPED", detail.get("ocrStatus").asString(),
-                            "expected ocrStatus=SKIPPED, got " + detail);
-                });
+        JsonNode detail = awaitOcr(documentId, token, "FAILED");
+        assertTrue(detail.get("ocrFailureReason").asString().contains("could not be decoded"),
+                "expected a decode failure reason: " + detail);
+    }
+
+    @Test
+    void unsupported_image_type_is_skipped_with_reason() throws Exception {
+        String token = registerVerifyAndLogin();
+        byte[] heic = "....ftypheic not really".getBytes(StandardCharsets.US_ASCII);
+
+        String documentId = uploadAndFinalize(token, "photo.heic", "image/heic", heic);
+
+        JsonNode detail = awaitOcr(documentId, token, "SKIPPED");
+        assertTrue(detail.get("ocrFailureReason").asString().contains("image/heic"),
+                "expected the skip reason to name the type: " + detail);
+    }
+
+    @Test
+    void ocr_text_is_tenant_scoped() throws Exception {
+        String owner = registerVerifyAndLogin();
+        String stranger = registerVerifyAndLogin();
+        String marker = "zebracrossing" + UUID.randomUUID().toString().substring(0, 8);
+        String documentId = uploadAndFinalize(owner, "private.pdf", "application/pdf",
+                newPdfWithText("Confidential " + marker + " medical record"));
+        awaitOcr(documentId, owner, "DONE");
+
+        mvc.perform(get("/api/v1/search").param("q", marker)
+                        .header("Authorization", "Bearer " + owner))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].documentId").value(documentId));
+        mvc.perform(get("/api/v1/search").param("q", marker)
+                        .header("Authorization", "Bearer " + stranger))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items.length()").value(0));
+        mvc.perform(get("/api/v1/documents/" + documentId)
+                        .header("Authorization", "Bearer " + stranger))
+                .andExpect(status().isNotFound());
     }
 
     // ── helpers ─────────────────────────────────────────────────────────────
+
+    private JsonNode awaitOcr(String documentId, String token, String expectedStatus) {
+        AtomicReference<JsonNode> last = new AtomicReference<>();
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(60))
+                .pollInterval(Duration.ofMillis(250))
+                .untilAsserted(() -> {
+                    JsonNode detail = getJsonAuth("/api/v1/documents/" + documentId, token);
+                    last.set(detail);
+                    assertEquals(expectedStatus, detail.get("ocrStatus").asString(),
+                            "expected ocrStatus=" + expectedStatus + ", got " + detail);
+                });
+        return last.get();
+    }
+
+    private static BufferedImage textImage(String text, int width, int height) {
+        BufferedImage image = new BufferedImage(width, height, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = image.createGraphics();
+        try {
+            g.setColor(Color.WHITE);
+            g.fillRect(0, 0, width, height);
+            g.setColor(Color.BLACK);
+            g.setRenderingHint(RenderingHints.KEY_TEXT_ANTIALIASING, RenderingHints.VALUE_TEXT_ANTIALIAS_ON);
+            g.setFont(new Font(Font.SANS_SERIF, Font.BOLD, height / 4));
+            g.drawString(text, 20, height / 2 + height / 8);
+        } finally {
+            g.dispose();
+        }
+        return image;
+    }
+
+    private static byte[] png(BufferedImage image) throws Exception {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        ImageIO.write(image, "png", out);
+        return out.toByteArray();
+    }
+
+    /** A PDF with no text layer at all — just the picture of a page. */
+    private static byte[] imageOnlyPdf(BufferedImage image) throws Exception {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage();
+            doc.addPage(page);
+            try (PDPageContentStream content = new PDPageContentStream(doc, page)) {
+                PDImageXObject xobj = LosslessFactory.createFromImage(doc, image);
+                content.drawImage(xobj, 50, 400, image.getWidth(), image.getHeight());
+            }
+            ByteArrayOutputStream out = new ByteArrayOutputStream();
+            doc.save(out);
+            return out.toByteArray();
+        }
+    }
+
+    private static Optional<String> locateTesseract() {
+        List<String> candidates = new ArrayList<>();
+        String env = System.getenv("TESSERACT_PATH");
+        if (env != null && !env.isBlank()) candidates.add(env);
+        candidates.addAll(List.of("tesseract", "/opt/homebrew/bin/tesseract", "/usr/local/bin/tesseract", "/usr/bin/tesseract"));
+        for (String candidate : candidates) {
+            try {
+                Process p = new ProcessBuilder(candidate, "--version")
+                        .redirectErrorStream(true).redirectOutput(ProcessBuilder.Redirect.DISCARD).start();
+                if (p.waitFor(10, TimeUnit.SECONDS) && p.exitValue() == 0) return Optional.of(candidate);
+                p.destroyForcibly();
+            } catch (Exception ignored) {
+                // try the next candidate
+            }
+        }
+        return Optional.empty();
+    }
 
     private String uploadAndFinalize(String token, String filename, String mime, byte[] bytes) throws Exception {
         String sha = sha256Hex(bytes);
