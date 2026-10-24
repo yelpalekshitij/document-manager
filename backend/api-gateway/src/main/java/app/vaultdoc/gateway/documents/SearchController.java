@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
+import app.vaultdoc.catalog.service.TagInput;
 import app.vaultdoc.gateway.documents.dto.SearchHitDto;
 import app.vaultdoc.gateway.documents.dto.SearchResponse;
 import app.vaultdoc.search.service.SearchPage;
@@ -31,8 +32,11 @@ public class SearchController {
             @RequestParam(required = false) String q,
             @RequestParam(required = false) UUID folderId,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "25") int pageSize) {
-        SearchPage result = search.search(UUID.fromString(userId), q, folderId, page, pageSize);
+            @RequestParam(defaultValue = "25") int pageSize,
+            @RequestParam(required = false) List<UUID> tagIds) {
+        // Same filter rules as the list endpoint; unknown/foreign ids just match nothing.
+        var tagFilter = TagInput.normalizeFilter(tagIds);
+        SearchPage result = search.search(UUID.fromString(userId), q, folderId, tagFilter, page, pageSize);
         List<SearchHitDto> hits = result.hits().stream().map(SearchHitDto::from).toList();
         return ResponseEntity.ok(new SearchResponse(hits, result.totalHits(), result.page(), result.pageSize()));
     }

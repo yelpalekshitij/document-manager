@@ -49,6 +49,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.get;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
+import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.put;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
@@ -208,7 +209,78 @@ class OcrPipelineIT extends DocumentITBase {
                 .andExpect(status().isNotFound());
     }
 
+    // ── OCR × tags (Phase 1.4 integration) ─────────────────────────────────
+    // Tags are set right after finalize, i.e. while tesseract is still running,
+    // so the consumer's later re-index must merge into the ES doc, not replace it.
+
+    @Test
+    void tagged_image_keeps_tags_after_tesseract_reindex() throws Exception {
+        assumeTrue(TESSERACT.isPresent(), "tesseract not installed — skipping real-engine IT");
+        String token = registerVerifyAndLogin();
+        String tagId = createTag(token, "receipts");
+        byte[] png = png(textImage("ZEBRAFISH TOTAL", 1400, 220));
+
+        String documentId = uploadAndFinalize(token, "till.png", "image/png", png);
+        setTags(token, documentId, tagId);
+
+        JsonNode detail = awaitOcr(documentId, token, "DONE");
+        assertEquals("receipts", detail.get("tags").get(0).get("name").asString());
+        // A word only tesseract can see, filtered by the tag: both halves must be in the index.
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(20))
+                .pollInterval(Duration.ofMillis(250))
+                .untilAsserted(() -> mvc.perform(get("/api/v1/search").param("q", "zebrafish")
+                                .param("tagIds", tagId)
+                                .header("Authorization", "Bearer " + token))
+                        .andExpect(status().isOk())
+                        .andExpect(jsonPath("$.items.length()").value(1))
+                        .andExpect(jsonPath("$.items[0].documentId").value(documentId))
+                        .andExpect(jsonPath("$.items[0].tagIds[0]").value(tagId)));
+    }
+
+    @Test
+    void skipped_image_keeps_tags_and_reason() throws Exception {
+        String token = registerVerifyAndLogin();
+        String tagId = createTag(token, "photos");
+        byte[] heic = "....ftypheic not really".getBytes(StandardCharsets.US_ASCII);
+
+        String documentId = uploadAndFinalize(token, "holiday.heic", "image/heic", heic);
+        setTags(token, documentId, tagId);
+
+        JsonNode detail = awaitOcr(documentId, token, "SKIPPED");
+        assertTrue(detail.get("ocrFailureReason").asString().contains("image/heic"),
+                "expected the skip reason to survive alongside tags: " + detail);
+        assertEquals("photos", detail.get("tags").get(0).get("name").asString());
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(20))
+                .pollInterval(Duration.ofMillis(250))
+                .untilAsserted(() -> mvc.perform(get("/api/v1/search").param("q", "holiday")
+                                .param("tagIds", tagId)
+                                .header("Authorization", "Bearer " + token))
+                        .andExpect(status().isOk())
+                        .andExpect(jsonPath("$.items[0].documentId").value(documentId)));
+    }
+
     // ── helpers ─────────────────────────────────────────────────────────────
+
+    private String createTag(String token, String name) throws Exception {
+        MvcResult res = mvc.perform(post("/api/v1/tags")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"name\":\"" + name + "\"}"))
+                .andExpect(status().isCreated())
+                .andReturn();
+        return json.readTree(res.getResponse().getContentAsString()).get("id").asString();
+    }
+
+    private void setTags(String token, String documentId, String... tagIds) throws Exception {
+        String ids = String.join("\",\"", tagIds);
+        mvc.perform(put("/api/v1/documents/" + documentId + "/tags")
+                        .header("Authorization", "Bearer " + token)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"tagIds\":[\"" + ids + "\"]}"))
+                .andExpect(status().isOk());
+    }
 
     private JsonNode awaitOcr(String documentId, String token, String expectedStatus) {
         AtomicReference<JsonNode> last = new AtomicReference<>();

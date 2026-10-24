@@ -3,8 +3,10 @@ package app.vaultdoc.search.service;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
@@ -12,13 +14,23 @@ import co.elastic.clients.elasticsearch.ElasticsearchClient;
 import co.elastic.clients.elasticsearch._types.Refresh;
 import co.elastic.clients.elasticsearch._types.query_dsl.BoolQuery;
 import co.elastic.clients.elasticsearch._types.query_dsl.Query;
+import co.elastic.clients.elasticsearch.core.BulkRequest;
+import co.elastic.clients.elasticsearch.core.BulkResponse;
 import co.elastic.clients.elasticsearch.core.SearchResponse;
 import co.elastic.clients.elasticsearch.indices.CreateIndexRequest;
 import co.elastic.clients.elasticsearch.indices.ExistsRequest;
 
 import app.vaultdoc.search.domain.DocumentIndexRecord;
+import app.vaultdoc.search.domain.DocumentTagsUpdate;
 
 public class ElasticsearchSearchService implements SearchService {
+
+    /**
+     * index() and updateTags() are both partial (read-modify-write) updates of
+     * disjoint field groups, so they race when OCR re-indexes while tags change.
+     * ES retries the merge on a seqNo conflict instead of failing either writer.
+     */
+    static final int RETRY_ON_CONFLICT = 5;
 
     private final ElasticsearchClient client;
     private final String indexName;
@@ -45,11 +57,16 @@ public class ElasticsearchSearchService implements SearchService {
         ensureIndex();
         Map<String, Object> body = toMap(record);
         try {
-            client.index(i -> i
-                    .index(indexName)
-                    .id(record.documentId().toString())
-                    .document(body)
-                    .refresh(refreshPolicy));
+            // Merge-upsert rather than replace: tag fields are owned by updateTags,
+            // and a re-index from another stage (OCR) must not wipe them.
+            client.update(u -> u
+                            .index(indexName)
+                            .id(record.documentId().toString())
+                            .doc(body)
+                            .docAsUpsert(true)
+                            .retryOnConflict(RETRY_ON_CONFLICT)
+                            .refresh(refreshPolicy),
+                    Map.class);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
@@ -69,7 +86,39 @@ public class ElasticsearchSearchService implements SearchService {
     }
 
     @Override
-    public SearchPage search(UUID userId, String query, UUID folderId, int page, int pageSize) {
+    public void updateTags(UUID userId, List<DocumentTagsUpdate> updates) {
+        if (updates == null || updates.isEmpty()) return;
+        ensureIndex();
+        BulkRequest.Builder bulk = new BulkRequest.Builder().refresh(refreshPolicy);
+        for (DocumentTagsUpdate update : updates) {
+            Map<String, Object> partial = new LinkedHashMap<>();
+            partial.put("tags", update.tagNames());
+            partial.put("tagIds", update.tagIds().stream().map(UUID::toString).toList());
+            // Plain partial update (no upsert): a document that isn't indexed yet
+            // gets its tags when it is finalized, never as a tag-only stub.
+            bulk.operations(op -> op.update(u -> u
+                    .index(indexName)
+                    .id(update.documentId().toString())
+                    .retryOnConflict(RETRY_ON_CONFLICT)
+                    .action(a -> a.doc(partial))));
+        }
+        try {
+            BulkResponse resp = client.bulk(bulk.build());
+            if (!resp.errors()) return;
+            List<String> failures = resp.items().stream()
+                    .filter(item -> item.error() != null && item.status() != 404)
+                    .map(item -> item.id() + ": " + item.error().reason())
+                    .toList();
+            if (!failures.isEmpty()) {
+                throw new IllegalStateException("Tag re-index failed for " + failures);
+            }
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    @Override
+    public SearchPage search(UUID userId, String query, UUID folderId, Set<UUID> tagIds, int page, int pageSize) {
         ensureIndex();
         int from = Math.max(0, page) * Math.max(1, pageSize);
         int size = Math.max(1, pageSize);
@@ -78,6 +127,12 @@ public class ElasticsearchSearchService implements SearchService {
         bool.filter(q -> q.term(t -> t.field("userId").value(userId.toString())));
         if (folderId != null) {
             bool.filter(q -> q.term(t -> t.field("folderId").value(folderId.toString())));
+        }
+        // One term filter per tag = AND semantics. Empty set = no tag filter.
+        if (tagIds != null) {
+            for (UUID tagId : tagIds) {
+                bool.filter(q -> q.term(t -> t.field("tagIds").value(tagId.toString())));
+            }
         }
         if (query != null && !query.isBlank()) {
             String trimmed = query.trim();
@@ -134,8 +189,17 @@ public class ElasticsearchSearchService implements SearchService {
                                 .properties("folderPath", p -> p.keyword(k -> k))
                                 .properties("documentType", p -> p.keyword(k -> k))
                                 .properties("tags", p -> p.keyword(k -> k))
+                                .properties("tagIds", p -> p.keyword(k -> k))
                                 .properties("uploadedAt", p -> p.date(d -> d))
                                 .properties("ocrText", p -> p.text(t -> t.analyzer("standard"))))));
+            } else {
+                // Pre-1.4 indexes lack tagIds. Adding a field to a mapping is
+                // allowed in place and is a no-op when it already exists; without
+                // it, dynamic mapping would make tagIds a text field and term
+                // filters on whole UUIDs would never match.
+                client.indices().putMapping(pm -> pm
+                        .index(indexName)
+                        .properties("tagIds", p -> p.keyword(k -> k)));
             }
             indexReady.set(true);
         } catch (IOException e) {
@@ -143,21 +207,23 @@ public class ElasticsearchSearchService implements SearchService {
         }
     }
 
+    /**
+     * Nullable fields are written as explicit JSON nulls: {@link #index} merges,
+     * so an omitted key would keep a stale value (e.g. a folder the document
+     * has left). Tag fields are deliberately absent — see {@link #updateTags}.
+     */
     private static Map<String, Object> toMap(DocumentIndexRecord r) {
-        var map = new java.util.LinkedHashMap<String, Object>();
+        var map = new LinkedHashMap<String, Object>();
         map.put("documentId", r.documentId().toString());
         map.put("userId", r.userId().toString());
         map.put("filename", r.filename());
         map.put("mimeType", r.mimeType());
         map.put("sizeBytes", r.sizeBytes());
-        if (r.folderId() != null) map.put("folderId", r.folderId().toString());
-        if (r.folderPath() != null) map.put("folderPath", r.folderPath());
-        if (r.documentType() != null) map.put("documentType", r.documentType());
-        if (r.tags() != null) map.put("tags", r.tags());
+        map.put("folderId", r.folderId() == null ? null : r.folderId().toString());
+        map.put("folderPath", r.folderPath());
+        map.put("documentType", r.documentType());
         map.put("uploadedAt", r.uploadedAt() == null ? null : r.uploadedAt().toString());
-        if (r.ocrText() != null && !r.ocrText().isBlank()) {
-            map.put("ocrText", r.ocrText());
-        }
+        map.put("ocrText", r.ocrText() == null || r.ocrText().isBlank() ? null : r.ocrText());
         return map;
     }
 
@@ -171,6 +237,11 @@ public class ElasticsearchSearchService implements SearchService {
         String documentType = (String) src.get("documentType");
         Object uploaded = src.get("uploadedAt");
         java.time.Instant uploadedAt = uploaded == null ? null : java.time.Instant.parse(uploaded.toString());
-        return new SearchHit(documentId, filename, mimeType, sizeBytes, folderId, folderPath, documentType, uploadedAt, score);
+        List<UUID> tagIds = new ArrayList<>();
+        if (src.get("tagIds") instanceof List<?> raw) {
+            for (Object id : raw) tagIds.add(UUID.fromString(id.toString()));
+        }
+        return new SearchHit(documentId, filename, mimeType, sizeBytes, folderId, folderPath, documentType,
+                uploadedAt, score, tagIds);
     }
 }

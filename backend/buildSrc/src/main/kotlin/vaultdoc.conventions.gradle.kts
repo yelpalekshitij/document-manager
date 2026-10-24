@@ -15,8 +15,8 @@ plugins {
 }
 
 jacoco {
-    // 0.8.14 is the first JaCoCo release with official Java 25 class-file support.
-    toolVersion = "0.8.14"
+    // Java 25 class files need JaCoCo 0.8.14+; 0.8.15 is the pinned line.
+    toolVersion = "0.8.15"
 }
 
 repositories {

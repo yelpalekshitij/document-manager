@@ -9,7 +9,11 @@ import { DocumentViewerComponent } from './document-viewer.component';
 import { FolderTreeComponent } from './folder-tree.component';
 import { SearchBarComponent } from './search-bar.component';
 import { UploadZoneComponent } from './upload-zone.component';
-import { DocumentSummary, SearchHit } from '../../core/api/types';
+import { DocumentSummary, SearchHit, Tag, TagRef } from '../../core/api/types';
+import { TagChipsComponent } from '../tags/tag-chips.component';
+import { TagFilterComponent } from '../tags/tag-filter.component';
+import { TagManagerComponent } from '../tags/tag-manager.component';
+import { TagsStore } from '../tags/tags.store';
 
 @Component({
   selector: 'vd-documents-page',
@@ -21,6 +25,9 @@ import { DocumentSummary, SearchHit } from '../../core/api/types';
     DocumentViewerComponent,
     FolderTreeComponent,
     SearchBarComponent,
+    TagChipsComponent,
+    TagFilterComponent,
+    TagManagerComponent,
     UploadZoneComponent,
   ],
   template: `
@@ -33,6 +40,7 @@ import { DocumentSummary, SearchHit } from '../../core/api/types';
           }
         </header>
         <vd-folder-tree />
+        <vd-tag-filter (manage)="managingTags.set(true)" />
         <div class="spacer"></div>
         <nav class="links">
           <a routerLink="/">Dashboard</a>
@@ -42,7 +50,10 @@ import { DocumentSummary, SearchHit } from '../../core/api/types';
 
       <main>
         <div class="topbar">
-          <h2>{{ heading() }}</h2>
+          <div>
+            <h2>{{ heading() }}</h2>
+            <p class="filter-summary" aria-live="polite">{{ filterSummary() }}</p>
+          </div>
           <vd-search-bar />
         </div>
 
@@ -58,6 +69,7 @@ import { DocumentSummary, SearchHit } from '../../core/api/types';
                 @for (h of store.searchHits(); track h.documentId) {
                   <li (click)="openFromHit(h)">
                     <span class="filename">{{ h.filename }}</span>
+                    <vd-tag-chips [documentId]="h.documentId" [tags]="hitTags(h)" />
                     <span class="uploaded">{{ h.uploadedAt | date: 'mediumDate' }}</span>
                   </li>
                 }
@@ -74,6 +86,10 @@ import { DocumentSummary, SearchHit } from '../../core/api/types';
 
     @if (selected(); as doc) {
       <vd-document-viewer [doc]="doc" (close)="selected.set(null)" />
+    }
+
+    @if (managingTags()) {
+      <vd-tag-manager (close)="managingTags.set(false)" />
     }
   `,
   styles: [
@@ -109,6 +125,7 @@ import { DocumentSummary, SearchHit } from '../../core/api/types';
         gap: 1rem; align-items: center;
       }
       h2 { margin: 0; font-size: 1.4rem; }
+      .filter-summary { margin: 0.2rem 0 0; color: var(--vd-fg-muted); font-size: 0.8rem; min-height: 1em; }
 
       .results, .docs {
         background: var(--vd-bg-card);
@@ -137,6 +154,17 @@ export class DocumentsPageComponent {
   private readonly router = inject(Router);
 
   protected readonly selected = signal<DocumentSummary | null>(null);
+  protected readonly managingTags = signal(false);
+  private readonly tags = inject(TagsStore);
+
+  /** "Tagged: tax + paid" — announced politely so filter changes are audible. */
+  protected readonly filterSummary = computed(() => {
+    const byId = this.tags.byId();
+    const names = this.store.selectedTagIds()
+      .map((id) => byId.get(id)?.name)
+      .filter((n): n is string => !!n);
+    return names.length ? `Tagged: ${names.join(' + ')}` : '';
+  });
 
   protected readonly heading = computed(() => {
     const id = this.store.selectedFolderId();
@@ -173,6 +201,15 @@ export class DocumentsPageComponent {
     this.selected.set(doc);
   }
 
+  /** Search hits carry tag ids only; names and colours come from the tag store. */
+  hitTags(hit: SearchHit): TagRef[] {
+    const byId = this.tags.byId();
+    return (hit.tagIds ?? [])
+      .map((id) => byId.get(id))
+      .filter((t): t is Tag => !!t)
+      .map((t) => ({ id: t.id, name: t.name, color: t.color }));
+  }
+
   openFromHit(hit: SearchHit): void {
     // Cast hit to DocumentSummary shape — they share the relevant fields.
     // ocrStatus comes from a follow-up getDetail call inside the viewer.
@@ -186,6 +223,7 @@ export class DocumentsPageComponent {
       documentType: hit.documentType,
       uploadedAt: hit.uploadedAt,
       ocrStatus: null,
+      tags: this.hitTags(hit),
     } as unknown as DocumentSummary);
   }
 

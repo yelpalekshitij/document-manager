@@ -2,6 +2,8 @@ package app.vaultdoc.gateway.documents;
 
 import java.time.Duration;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import jakarta.validation.Valid;
@@ -21,7 +23,10 @@ import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import app.vaultdoc.catalog.domain.Document;
+import app.vaultdoc.catalog.domain.Tag;
 import app.vaultdoc.catalog.service.DocumentService;
+import app.vaultdoc.catalog.service.TagInput;
+import app.vaultdoc.catalog.service.TagService;
 import app.vaultdoc.core.storage.ObjectStorage;
 import app.vaultdoc.core.storage.StorageKey;
 import app.vaultdoc.core.storage.StorageProperties;
@@ -43,6 +48,7 @@ public class DocumentController {
     private final DocumentService documents;
     private final ObjectStorage storage;
     private final SearchService search;
+    private final TagService tags;
     private final Duration downloadTtl;
 
     public DocumentController(
@@ -50,11 +56,13 @@ public class DocumentController {
             DocumentService documents,
             ObjectStorage storage,
             SearchService search,
+            TagService tags,
             StorageProperties storageProperties) {
         this.ingest = ingest;
         this.documents = documents;
         this.storage = storage;
         this.search = search;
+        this.tags = tags;
         this.downloadTtl = storageProperties.presignGetTtl();
     }
 
@@ -81,8 +89,9 @@ public class DocumentController {
     public ResponseEntity<DocumentDetail> finalize(
             @AuthenticationPrincipal String userId,
             @Valid @RequestBody FinalizeUploadRequest req) {
-        Document doc = ingest.finalizeUpload(UUID.fromString(userId), req.documentId());
-        return ResponseEntity.ok(DocumentDetail.from(doc));
+        UUID uid = UUID.fromString(userId);
+        Document doc = ingest.finalizeUpload(uid, req.documentId());
+        return ResponseEntity.ok(DocumentDetail.from(doc, tagsOf(uid, doc.getId())));
     }
 
     @GetMapping
@@ -90,12 +99,18 @@ public class DocumentController {
             @AuthenticationPrincipal String userId,
             @RequestParam(required = false) UUID folderId,
             @RequestParam(defaultValue = "0") int page,
-            @RequestParam(defaultValue = "50") int pageSize) {
+            @RequestParam(defaultValue = "50") int pageSize,
+            @RequestParam(required = false) List<UUID> tagIds) {
+        UUID uid = UUID.fromString(userId);
+        Set<UUID> tagFilter = TagInput.normalizeFilter(tagIds);
         var p = PageRequest.of(Math.max(0, page), Math.min(Math.max(1, pageSize), 200),
                 Sort.by(Sort.Direction.DESC, "uploadedAt"));
-        var result = documents.list(UUID.fromString(userId), folderId, p);
+        var result = documents.list(uid, folderId, tagFilter, p);
+        // One batched tag lookup for the whole page, not one per row.
+        Map<UUID, List<Tag>> tagsByDoc = tags.tagsForDocuments(uid,
+                result.getContent().stream().map(Document::getId).toList());
         List<DocumentSummary> items = result.getContent().stream()
-                .map(DocumentSummary::from)
+                .map(d -> DocumentSummary.from(d, tagsByDoc.getOrDefault(d.getId(), List.of())))
                 .toList();
         return ResponseEntity.ok(new DocumentListResponse(items, page, pageSize, result.getTotalElements()));
     }
@@ -104,8 +119,13 @@ public class DocumentController {
     public ResponseEntity<DocumentDetail> get(
             @AuthenticationPrincipal String userId,
             @PathVariable UUID id) {
-        var doc = documents.findByIdForUser(UUID.fromString(userId), id);
-        return ResponseEntity.ok(DocumentDetail.from(doc));
+        UUID uid = UUID.fromString(userId);
+        var doc = documents.findByIdForUser(uid, id);
+        return ResponseEntity.ok(DocumentDetail.from(doc, tagsOf(uid, id)));
+    }
+
+    private List<Tag> tagsOf(UUID userId, UUID documentId) {
+        return tags.tagsForDocuments(userId, List.of(documentId)).getOrDefault(documentId, List.of());
     }
 
     @GetMapping("/{id}/download")

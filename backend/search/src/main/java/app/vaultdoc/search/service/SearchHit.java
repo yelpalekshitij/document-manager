@@ -1,6 +1,7 @@
 package app.vaultdoc.search.service;
 
 import java.time.Instant;
+import java.util.List;
 import java.util.UUID;
 
 public record SearchHit(
@@ -12,4 +13,10 @@ public record SearchHit(
         String folderPath,
         String documentType,
         Instant uploadedAt,
-        double score) {}
+        double score,
+        List<UUID> tagIds) {
+
+    public SearchHit {
+        tagIds = tagIds == null ? List.of() : List.copyOf(tagIds);
+    }
+}

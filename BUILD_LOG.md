@@ -648,64 +648,83 @@ docker manifest inspect pgvector/pgvector:pg17            # all 3 new datastore 
 
 ---
 
-## Phase 1.4 — Tesseract OCR for Images + Scanned PDFs  *(2026-10-24)*
+## Phase 1.4 — Tesseract Image OCR + Tags  *(2026-10-24)*
 
-**Goal:** Close the Phase 1.3 gap where every image upload ended `SKIPPED` and image-only PDFs came back with empty text. Photos and scans are most of what users upload from a phone — they must be searchable by content.
+**Goal:** Close the two slices deferred from 1.2/1.3. **OCR:** every image upload ended `SKIPPED` and image-only PDFs came back empty; photos and scans are most of what users upload from a phone, so they must be searchable by content. **Tags:** V7 created `tags` + `document_tags` and the ES mapping had a `tags` keyword, but nothing used them; users get tag CRUD, tag chips, and tags as a search/list filter.
 
-Built strictly test-first: the case matrix is [`docs/phase-1.4/ocr-cases.md`](./docs/phase-1.4/ocr-cases.md) (one row per behaviour, each naming its test).
+Built **test-first (TDD)** in two parallel slices, each against a case matrix written before the code (one row per behaviour, each naming its test): [`docs/phase-1.4/ocr-cases.md`](./docs/phase-1.4/ocr-cases.md) (109 rows), [`docs/phase-1.4/tags-cases.md`](./docs/phase-1.4/tags-cases.md) (111 rows), and the cross-slice [`docs/phase-1.4/integration-cases.md`](./docs/phase-1.4/integration-cases.md) (7 rows) written while merging. Red → green evidence per test class is in the slice commits (`phase-1.4-ocr`, `phase-1.4-tags`); green-on-first-run ITs were proven by mutation (re-introducing the bug fails them).
 
 ### Scope
 
 | In | Deferred |
 |---|---|
-| Tesseract CLI runner, image OCR (JPEG/PNG/TIFF/WebP), per-page scanned-PDF fallback (hybrid PDFs), MIME router, language config with graceful degradation, byte/pixel/page/DPI/timeout limits, `api-gateway` runtime Dockerfile with `eng`+`hin`, JaCoCo in the convention plugin, web OCR failure/skip reason display + badge a11y. | Per-document language auto-detection (CLAUDE.md §14). HEIC (leptonica can't read it — `SKIPPED` with reason; needs a converter). Textract / Doc AI fallback (Phase 2). Concurrency cap on tesseract processes (consumer is single-threaded today). Mobile badge copy (Flutter not installed here; no API change, so the Dart client is unaffected). |
+| **OCR:** Tesseract CLI runner, image OCR (JPEG/PNG/TIFF/WebP), per-page scanned-PDF fallback (hybrid PDFs), MIME router, language config (`eng+hin`) with graceful degradation, byte/pixel/page/DPI/timeout limits, `api-gateway` runtime Dockerfile, web OCR failure/skip reason + badge a11y. **Tags:** OpenAPI `Tags` tag (list with counts, create, rename/recolour, delete, set/add/remove on a document), `tagIds` AND-filter on `GET /documents` + `GET /search`, `tags` on `DocumentSummary`/`DocumentDetail`, `tagIds` on `SearchHit`; catalog `TagService`; gateway `TagController` + `DocumentTagController` + `TagIndexSynchronizer`; ES `tagIds` + `updateTags`; web tag store, sidebar filter, manager dialog, chips. **Both:** JaCoCo in the convention plugin. | Per-document language auto-detection (CLAUDE.md §14). HEIC OCR (leptonica can't read it — `SKIPPED` with reason; needs a converter). Textract / Doc AI fallback (Phase 2). Tesseract concurrency cap (consumer is single-threaded today). Bulk tagging, nested tags, case-insensitive free-text tag match (needs index v2). Focus return to "Manage" on dialog close. **Mobile:** Dart client regen, tag chips/filter, OCR badge copy — Flutter not installed in the build environment. Comment-only migration for `ocr_failure_reason` (V8 comment still says FAILED-only). |
 
 ### Decisions locked
 
-- **Tesseract via the CLI (`ProcessBuilder`), not Tess4J/JNA.** A crash, leak or runaway in native Tesseract/Leptonica stays in a child process instead of killing the JVM; timeouts are enforceable by killing the process (descendants first); no `--enable-native-access` / JNA restricted-method warnings on Java 25; no per-platform `libtesseract` lookup (Homebrew arm64 vs Debian paths). Cost is ~50 ms process start per call — irrelevant next to OCR time. Matches CLAUDE.md's "Tesseract 5 (CLI)". The `tess4j` catalog entry stays unused.
-- **`OcrService` stays the abstraction; `RoutingOcrService` is the bean.** It normalises MIME (case, whitespace, `;params`, `image/jpg` alias) and dispatches: PDF → `PdfBoxOcrService` (+ `ScannedPdfFallback`), images → `ImageOcrService`, else `SKIPPED` with a reason. It also turns an engine exception or `null` into `FAILED` — the last guard against silent failure.
-- **Scanned-PDF fallback is per page.** A page whose text layer has < `pdf-min-text-chars-per-page` (25) visible chars is rendered (grayscale, `pdf-ocr-dpi` 300) and OCR'd; OCR text replaces the layer only when longer. Hybrid PDFs (digital cover + scanned annexures) only pay for OCR on scanned pages. At most `pdf-ocr-max-pages` (20) pages per document.
-- **Limits fail loudly, never OOM.** Byte cap (25 MB) before decoding; pixel cap (50 MP) from the image *header* (ImageIO readers, hand-parsed RIFF/VP8/VP8L/VP8X for WebP since the JDK has no WebP reader) and from the PDF page box *before* rendering. All → `FAILED` with a reason.
-- **Languages: `eng+hin` default, degrade gracefully.** `TesseractLanguageResolver` intersects config with `tesseract --list-langs`, logs **one** WARN naming missing packs, continues with the installed subset; only "none installed" is `FAILED`. Successful resolution cached; a failed listing (binary missing) is not, so each document surfaces it. Language tokens must match `[A-Za-z][A-Za-z0-9_]{0,39}` — they become process args. Blank config means the default; all-invalid falls back to `eng`.
-- **Boot-time probe is informational.** Startup logs the languages in use, or a WARN if tesseract is missing — never fatal (text PDFs work without it).
-- **Temp files:** one owner-only scratch dir per job (`vaultdoc.ocr.temp-dir`, default `java.io.tmpdir`), deleted on every path; the runner's stdout/stderr go to files (no pipe-buffer deadlock) in its own scratch dir, also always deleted.
-- **`SKIPPED` carries a reason** in `ocrFailureReason` (the column already existed; no migration, no OpenAPI change). `OcrStatus` names unchanged (`DONE` = completed).
-- **Runtime image:** `backend/api-gateway/Dockerfile` (eclipse-temurin:25-jre-noble + `tesseract-ocr`, `-eng`, `-hin`, non-root, `OCR_TEMP_DIR=/app/ocr-tmp` mode 700). Verified: `tesseract 5.3.4`, `--list-langs` → `eng hin osd`, libwebp present.
-- **JaCoCo 0.8.14** (first with Java 25 support) in `vaultdoc.conventions`; `jacocoTestReport` finalizes every `test` task (XML + HTML).
+- **Tesseract via the CLI (`ProcessBuilder`), not Tess4J/JNA.** Native crashes/leaks stay in a child process; timeouts are enforced by killing the process tree; no `--enable-native-access` on Java 25; no per-platform `libtesseract` lookup. Matches CLAUDE.md's "Tesseract 5 (CLI)". The `tess4j` catalog entry is unused (left for a cleanup PR).
+- **`RoutingOcrService` is the `OcrService` bean.** Normalises MIME (case, `;params`, `image/jpg`) → PDF engine / image engine / `SKIPPED` with a reason; an engine exception or `null` becomes `FAILED` — the last guard against silent failure.
+- **Scanned-PDF fallback is per page.** Pages with < 25 visible chars are rendered (300 DPI) and OCR'd; OCR text replaces the layer only when longer. ≤ 20 pages per document.
+- **Limits fail loudly before allocating:** 25 MB byte cap, 50 MP pixel cap read from the image header (hand-parsed WebP) or the PDF page box, 60 s timeout per image/page → `FAILED` with a reason.
+- **Languages degrade gracefully:** config ∩ `tesseract --list-langs`, one WARN for missing packs, only "none installed" fails. Tokens restricted to `[A-Za-z][A-Za-z0-9_]{0,39}` (they become process args). Boot-time probe logs, never fails startup.
+- **`SKIPPED` carries a reason** in the existing `ocrFailureReason` (no migration; OpenAPI description only).
+- **No tag migration and no seeded tags.** V7 already fits (`UNIQUE (user_id, LOWER(name))`, cascading `document_tags`); the 8 default folders already are the starter taxonomy. No V-number used by either slice, so nothing to renumber.
+- **Tag name rules** (`TagInput`, pure): NFC, Unicode-aware whitespace collapse, no control chars, 1–64 **code points** (Postgres `VARCHAR` semantics), colour `#rrggbb` lowercase. Case-insensitive uniqueness → `409 tag-name-conflict` (incl. lost races); 500 tags/user, 50 tags/document.
+- **Tenant scoping:** a foreign tag/document is a 404 like a missing one; an unknown/foreign tagId in a *filter* is an empty 200 (leaks nothing, bookmarked filters survive deletes). Filter ids deduped, ≤ 20.
+- **Idempotent assignment:** `INSERT … ON CONFLICT DO NOTHING`; set/add/remove return the document's resulting tags.
+- **One owner per ES field group.** `SearchService.updateTags` owns `tags`/`tagIds`; `index()` became a merge-upsert that never writes them (the OCR consumer used to wipe tags with a full replace). **Both are partial updates with `retry_on_conflict = 5`** (added at integration — see Bugs).
+- **Tag re-sync lives in the gateway** (`TagIndexSynchronizer`, AFTER_COMMIT on `DocumentTagsChangedEvent` + `DocumentFinalizedEvent`); failures logged, never fail the request.
+- **New problem types:** `tag-not-found` 404, `tag-name-conflict` 409, `tag-limit-reached` 409, `invalid-tag` 400, plus `malformed-request` 400 and `validation` 400 for non-UUID path/query values (previously empty 400s / 500s).
+- **JaCoCo 0.8.15** (Java 25 needs ≥ 0.8.14) in `vaultdoc.conventions`; `jacocoTestReport` finalizes every `test` task. Both slices added it — merged to one block.
 
 ### What landed
 
-- **`ocr/tesseract`:** `TesseractRunner` (seam), `CliTesseractRunner`, `TesseractLanguageResolver`, `TesseractException` / `TesseractTimeoutException` / `TesseractUnavailableException`.
-- **`ocr/service`:** `RoutingOcrService`, `ImageOcrService`, `ScannedPdfFallback`, `ImageDimensions` (+ `ImageDecodeException`), `TempWorkspace`, `OcrText`; `PdfBoxOcrService` gains the per-page fallback and a friendly password-protected reason.
-- **`ocr/config`:** `OcrProperties` gains 11 knobs (`@With` for tests, out-of-range → default); `OcrAutoConfiguration` wires runner → resolver → engines → router and probes at boot.
-- **`api-gateway`:** `application.yml` `vaultdoc.ocr.*` env-backed keys; `Dockerfile`.
-- **Web:** `ocr-status.ts` (badge copy), list badge gets `role="img"` + `aria-label`; viewer shows FAILED reason in a `role="alert"` (panel auto-opens), SKIPPED reason, "No text was found" for blank scans, and a fetch error instead of "Loading…" forever.
-- **Infra:** `infra/README.md` OCR section (install, env vars, degradation behaviour).
+- **`ocr`:** `tesseract/` (`TesseractRunner`, `CliTesseractRunner`, `TesseractLanguageResolver`, 3 exceptions); `service/` (`RoutingOcrService`, `ImageOcrService`, `ScannedPdfFallback`, `ImageDimensions`, `TempWorkspace`, `OcrText`; `PdfBoxOcrService` fallback + password-protected reason); `OcrProperties` +11 knobs; `OcrAutoConfiguration` wiring + boot probe.
+- **`catalog`:** `Tag`/`DocumentTag` entities + repositories, `TagService`/`TagServiceImpl`, `TagInput`, `DocumentTagsChangedEvent`; `DocumentService.list` AND tag filter.
+- **`search`:** `tagIds` keyword (in-place `putMapping` for old indexes), bulk `updateTags`, tag filter clause, merge-upsert `index()`, `retry_on_conflict` on both update paths.
+- **`api-gateway`:** `TagController`, `DocumentTagController`, `TagIndexSynchronizer`, tag filter + embedded tags on documents/search, new problem types; `application.yml` `vaultdoc.ocr.*` env-backed keys; `Dockerfile` (temurin 25 JRE + `tesseract-ocr` `eng`/`hin`, non-root; verified `tesseract 5.3.4`, `--list-langs` → `eng hin osd`).
+- **OpenAPI:** `Tags` tag + 7 operations, `tagIds` query params appended after existing ones, `tags`/`tagIds` fields, `ocrFailureReason` description.
+- **Web:** `ocr-status.ts`, labelled OCR badge, viewer FAILED/SKIPPED reasons + fetch-error state; `features/tags/` (store, filter, manager, chips); chips in list/viewer/search hits; `tsconfig.app.json` excludes specs.
+- **Infra/docs:** `infra/README.md` OCR section; three case matrices under `docs/phase-1.4/`.
+- **Integration (merge commit):** conflicts resolved in `openapi/vaultdoc.yaml` (`DocumentDetail` keeps both `ocrFailureReason` description and `tags`), `vaultdoc.conventions.gradle.kts` (single JaCoCo block), `document-list.component.ts` (badge + chips imports); `document-viewer.component.ts` auto-merged (verified both slices' logic intact). OCR web specs updated to stub the tag dependencies the merged components inject.
 
-### Tests added: 98 backend (cumulative 213, all green) + 3 web spec files (written first, not yet executed)
+### Tests added: 264 backend (115 → 379, all green, 0 skipped) + 8 web spec files (written first, not yet executed)
 
-- Unit (fake runner / fake `/bin/sh` binaries — no tesseract needed): `RoutingOcrServiceTest` (17), `ImageOcrServiceTest` (20), `PdfBoxOcrServiceTest` (+14 → 18), `ImageDimensionsTest` (4), `CliTesseractRunnerTest` (9: args, exit codes, timeout kills process **and child**, interrupt, missing binary, 1 MB output no-deadlock, scratch cleanup), `TesseractLanguageResolverTest` (6), `OcrPropertiesTest` (11), `OcrAutoConfigurationTest` (4), `UploadFinalizedConsumerTest` (6, characterization).
-- Real engine, `Assumptions`-gated: `TesseractCliIT` (3) — Java2D PNG and image-only PDF read back.
-- `OcrPipelineIT` (+5 → 7): PNG → `DONE` + searchable, scanned PDF → `DONE` via fallback + searchable (both real-engine, gated), corrupt JPEG → `FAILED` + reason, HEIC → `SKIPPED` + reason, OCR text tenant-scoped (other user: 0 hits, 404).
-- Coverage (JaCoCo line): `ocr` **90.3%**, `api-gateway` 85.4%.
+- **OCR slice (98):** `RoutingOcrServiceTest` 17, `ImageOcrServiceTest` 20, `PdfBoxOcrServiceTest` +14, `ImageDimensionsTest` 4, `CliTesseractRunnerTest` 9, `TesseractLanguageResolverTest` 6, `OcrPropertiesTest` 11, `OcrAutoConfigurationTest` 4, `UploadFinalizedConsumerTest` 6, `TesseractCliIT` 3 (real binary, gated), `OcrPipelineIT` +5.
+- **Tags slice (163):** `TagInputTest` 30, `TagServiceImplTest` 44, `DocumentServiceImplTest` 16, `DefaultFolderSeederTest` 2, `TagDomainTest` 3, `CatalogAutoConfigurationTest` 1, `ElasticsearchSearchServiceTagIT` 12, `TagApiContractTest` 31, `TagIndexSynchronizerTest` 7, `TagFlowIT` 17.
+- **Integration (3):** `ElasticsearchSearchServiceTagIT.concurrentReindexAndTagUpdate_bothApply` (RED with `version_conflict_engine_exception` → GREEN, 3/3 reruns), `OcrPipelineIT.tagged_image_keeps_tags_after_tesseract_reindex` (real engine), `OcrPipelineIT.skipped_image_keeps_tags_and_reason`. Plus 2 new web cases in the OCR list/viewer specs.
+- **Coverage (JaCoCo line, merged tree):** `ocr` 90.3%, `catalog` 90.5%, `api-gateway` 89.1%, `search` 83.4% — every module touched in 1.4 is ≥ 80%. Untouched and still below the bar (first-ever numbers, JaCoCo is new): `core-auth` 51.8%, `ingest` 65.5%, `core-storage` 0% (exercised only via gateway ITs, which per-module JaCoCo doesn't credit).
 
 ### Bugs hit & fixed
 
-- **Logback capture in parallel tests** → `ClassCastException: SubstituteLogger` (SLF4J still initialising when concurrent test classes grab loggers). Fix: the resolver takes an injectable warning sink (`Consumer<String>`, production = `log::warn`) instead of tests scraping Logback.
-- **Timeout test race:** a 500 ms budget could expire before the fake binary wrote its pid under parallel load. 3 s budget + also assert the child `sleep` dies.
-- **PDFBox render width off by one** (612 pt × 100/72f floors to 849): DPI assertion uses ±1 px.
-- **UTF-8 truncation** (pre-existing in 1.3's cap): backing up over continuation bytes *before* the cut could leave a dangling lead byte (→ U+FFFD, can exceed the cap). Now checks the byte *at* the cut.
+- **Integration: ES version conflict between OCR re-index and tag sync.** On the merged tree `TagFlowIT.ocrReindex_preservesTags` failed: the consumer's `index()` (partial update + upsert) and `TagIndexSynchronizer`'s `updateTags` (partial update) raced on the same doc → `version_conflict_engine_exception` → the consumer treated it as a pipeline error and DLQ'd the entry, so the OCR text never reached the index. Latent in the tags slice (timing-dependent). Fix: `retryOnConflict(5)` on both update paths; pinned by a contention test (4 re-indexers × 4 taggers × 50 ops).
+- **Integration: OCR web specs vs merged components.** List/viewer now render `<vd-tag-chips>` (injects `TagsStore` → `TagsService`) and read `selectedTagIds`/`documents`/`tagError`; the OCR slice's store stubs lacked them. Stubs extended.
+- **OCR re-index wiped tags** (latent since 1.3: full replace with `tags = []`). Fixed by the merge-upsert; proven by mutation.
+- **UTF-8 cap could split a multi-byte char** (since 1.3) → U+FFFD and over-limit text. `OcrText.capToLimit` checks the byte at the cut.
+- **Logback capture in parallel tests** → `ClassCastException: SubstituteLogger`; resolver takes an injectable warning sink.
+- **CLI timeout test race** (500 ms budget vs fake binary start) → 3 s budget + assert the child dies too. **PDFBox render width off by one** (612 pt @ 100 DPI = 849 px) → ±1 px.
+- **`@MockitoBean` + concurrent JUnit** interleaved stubbing in the contract test → `@Execution(SAME_THREAD)`.
+- **`tsconfig.app.json` type-checked specs** with `types: []` — the first spec would have broken `ng build`; specs excluded.
 
 ### Verification
 
 ```bash
-cd backend && ./gradlew test            # 213 green; jacoco reports in */build/reports/jacoco/test/
-brew install tesseract tesseract-lang   # or apt-get install tesseract-ocr tesseract-ocr-{eng,hin}
-./gradlew :api-gateway:bootRun          # log: "Tesseract languages in use: [eng, hin]"
+cd backend && ./gradlew clean test jacocoTestReport   # 379 green, 0 skipped (tesseract 5.5.2 installed);
+                                                      # reports in */build/reports/jacoco/test/
+brew install tesseract tesseract-lang                 # or apt-get install tesseract-ocr tesseract-ocr-{eng,hin}
+./gradlew :api-gateway:bootRun                        # log: "Tesseract languages in use: [eng, hin]"
 ./gradlew :api-gateway:bootJar && docker build -t vaultdoc/api-gateway backend/api-gateway
-cd ../web && npm install && npm test    # web specs (not run in the build environment)
-# Manual: drop a phone photo of a receipt → badge ✓, words searchable; drop a scanned PDF → ✓;
-# drop a .heic → · with "OCR is not supported for image/heic"; uninstall tesseract → ✗ with reason in viewer.
+
+cd ../web && npm install && npm test && npm run build # NOT run in Phase 1.4 — node/npm were blocked in every
+#   build environment (both slices and the integration). The 8 spec files have never compiled. Also confirm
+#   the generated client's call style: openapitools.json sets useSingleRequestParameter=true while all
+#   store calls (since 1.1) pass positional args / bare bodies.
+
+# Manual loop: sign in → /documents → drop a phone photo of a receipt → badge ✓, words searchable →
+# sidebar "Tags · Manage" → create "Receipts" → add via the row's chip select → click "Receipts" in the
+# sidebar → list filters → search an image-only word → hit respects tag + query → drop a scanned PDF → ✓ →
+# drop a .heic → · "OCR is not supported for image/heic", tag still attachable → rename/delete the tag →
+# chips update in place.
 ```
 
 ---
@@ -724,4 +743,4 @@ cd ../web && npm install && npm test    # web specs (not run in the build enviro
 | 1.2 | 108 backend (87 + 7 IngestServiceImplTest + 8 FolderServiceImplTest + 4 DocumentFlowIT + 2 housekeeping) + web documents feature |
 | 1.3 | 115 backend (108 + 4 PdfBoxOcrServiceTest + 3 OcrPipelineIT) + web OCR badge + extracted-text panel |
 | 1.3.5 | 115 backend (unchanged — platform upgrade, all green on Java 25 / Spring Boot 4.1 / Jackson 3 / ES 9) |
-| 1.4 (OCR) | 213 backend (115 + 98 OCR slice) + 3 web spec files |
+| 1.4 | 379 backend (115 + 98 OCR + 163 tags + 3 OCR×tags integration) + 8 web spec files (unexecuted — npm unavailable) |

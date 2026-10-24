@@ -2,7 +2,7 @@
 
 > Privacy-first document intelligence platform. Self-hostable. Mobile-first. Built for people who actually need to find that 2021 bank statement at 11 PM.
 
-**Status:** 🚧 Phase 1.0 — Skeleton & Infrastructure. Not yet usable.
+**Status:** 🚧 Phase 1.4 — Phase 1 (Vault Foundation) is mostly done but **not complete**. The backend is done and green (379 tests): auth with passkeys and TOTP, presigned upload, S3 storage, folders, tags, OCR (PDFBox plus Tesseract for images and scans), and search. The Angular shell has upload, search, viewer and tags; the Phase 1.4 web specs have not been run yet. Still open for Phase 1: the Flutter skeleton has login but no document list. See [BUILD_LOG.md](./BUILD_LOG.md).
 
 A polished `README.md` will be produced at the end of Phase 6. Until then, see:
 

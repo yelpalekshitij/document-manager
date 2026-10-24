@@ -1,8 +1,11 @@
+import { signal } from '@angular/core';
 import { ComponentFixture, TestBed } from '@angular/core/testing';
 
 import { DocumentViewerComponent } from './document-viewer.component';
 import { DocumentsStore } from './documents.store';
+import { TagsService } from '../../core/api/generated';
 import { DocumentDetail, DocumentSummary } from '../../core/api/types';
+import { createTagsApiSpy } from '../tags/tags.spec-helpers';
 
 describe('DocumentViewerComponent — extracted-text panel', () => {
   const summary = {
@@ -28,8 +31,12 @@ describe('DocumentViewerComponent — extracted-text panel', () => {
           useValue: {
             getDownloadUrl: () => Promise.resolve('https://storage.test/scan.png'),
             getDetail,
+            // The viewer's tag bar (tags slice) reads the list for the doc's current chips.
+            documents: signal<DocumentSummary[]>([]),
+            tagError: signal<string | null>(null),
           },
         },
+        { provide: TagsService, useValue: createTagsApiSpy() },
       ],
     });
     fixture = TestBed.createComponent(DocumentViewerComponent);
@@ -57,6 +64,18 @@ describe('DocumentViewerComponent — extracted-text panel', () => {
     expect(alert).not.toBeNull();
     expect(alert!.textContent).toContain('tesseract timed out after 60s');
     expect(panel(el).open).toBeTrue();
+  });
+
+  it('shows the detail tags next to the FAILED reason', async () => {
+    const el = await render(() =>
+      Promise.resolve(
+        detail({ ocrStatus: 'FAILED', ocrFailureReason: 'image exceeds 50 MP', tags: [{ id: 't1', name: 'receipts' }] }),
+      ),
+    );
+    await settle();
+
+    expect(el.querySelector('.tag-bar li.chip .label')?.textContent?.trim()).toBe('receipts');
+    expect(body(el).querySelector('[role="alert"]')!.textContent).toContain('image exceeds 50 MP');
   });
 
   it('falls back to generic copy when FAILED has no reason', async () => {
