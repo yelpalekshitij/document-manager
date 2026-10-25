@@ -181,7 +181,8 @@ class ImageOcrServiceTest {
         OcrResult result = service.extract(key, "image/png");
 
         assertThat(result.status()).isEqualTo(OcrStatus.FAILED);
-        assertThat(result.failureReason()).contains("Could not stage image for OCR");
+        assertThat(result.failureReason()).contains("Could not stage image for OCR")
+                .doesNotContain(tempRoot.toString());
         assertThat(runner.calls()).isEmpty();
     }
 
@@ -377,25 +378,29 @@ class ImageOcrServiceTest {
     @Test
     void missing_binary_is_failed_with_reason() {
         when(storage.download(key)).thenReturn(png);
-        var unavailable = new TesseractUnavailableException("tesseract not available at 'tesseract'", null);
+        var unavailable = new TesseractUnavailableException(
+                "tesseract not available at '/opt/secret/bin/tesseract': error=2, No such file or directory", null);
         var runner = FakeTesseractRunner.throwing(unavailable).withListFailure(unavailable);
 
         OcrResult result = service(runner).extract(key, "image/png");
 
         assertThat(result.status()).isEqualTo(OcrStatus.FAILED);
-        assertThat(result.failureReason()).contains("tesseract not available");
+        assertThat(result.failureReason()).contains("tesseract not available")
+                .doesNotContain("/opt/secret").doesNotContain("error=2");
     }
 
     @Test
-    void non_zero_exit_is_failed_with_stderr() {
+    void non_zero_exit_is_failed_without_leaking_stderr() {
         when(storage.download(key)).thenReturn(png);
 
-        OcrResult result = service(FakeTesseractRunner.throwing(
-                new TesseractException("tesseract failed with exit code 1: Error in pixReadStream")))
+        OcrResult result = service(FakeTesseractRunner.throwing(new TesseractException(
+                "tesseract failed with exit code 1: Error in pixReadStream: /tmp/vaultdoc-tess-1/in.png",
+                "tesseract failed with exit code 1", null)))
                 .extract(key, "image/png");
 
         assertThat(result.status()).isEqualTo(OcrStatus.FAILED);
-        assertThat(result.failureReason()).contains("exit code 1").contains("pixReadStream");
+        assertThat(result.failureReason()).contains("exit code 1")
+                .doesNotContain("pixReadStream").doesNotContain("/tmp/");
     }
 
     @Test

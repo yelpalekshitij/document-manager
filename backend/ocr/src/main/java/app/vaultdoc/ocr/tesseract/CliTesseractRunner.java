@@ -119,8 +119,8 @@ public class CliTesseractRunner implements TesseractRunner {
 
             String stderr = read(err);
             if (process.exitValue() != 0) {
-                throw new TesseractException("tesseract failed with exit code " + process.exitValue()
-                        + ": " + tail(stderr));
+                String exit = "tesseract failed with exit code " + process.exitValue();
+                throw new TesseractException(exit + ": " + tail(stderr), exit, null);
             }
             return new Output(read(out), stderr);
         } finally {
@@ -134,7 +134,8 @@ public class CliTesseractRunner implements TesseractRunner {
             Files.createDirectories(workRoot);
             return Files.createTempDirectory(workRoot, "vaultdoc-tess-");
         } catch (IOException e) {
-            throw new TesseractException("could not create tesseract scratch directory: " + e.getMessage(), e);
+            throw new TesseractException("could not create tesseract scratch directory: " + e.getMessage(),
+                    "could not create tesseract scratch directory", e);
         }
     }
 

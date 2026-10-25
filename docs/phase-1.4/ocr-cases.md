@@ -190,6 +190,15 @@ unless the class is under `api-gateway`. Web specs live next to the component.
 | X1 | Runtime image ships `tesseract-ocr` + `eng` + `hin` | `tesseract --list-langs` in the image lists both | `backend/api-gateway/Dockerfile` — manual `docker build` + `docker run … --list-langs` (see BUILD_LOG 1.4) |
 | X2 | Infra README documents the OCR knobs + local install | — | `infra/README.md` review |
 
+## 14. User-visible failure reasons carry no internals
+
+| # | Case | Expected | Verified by |
+|---|---|---|---|
+| S1 | Tesseract exits non-zero with stderr | reason says the exit code; stderr only in logs | `ImageOcrServiceTest › non_zero_exit_is_failed_without_leaking_stderr`, `CliTesseractRunnerTest › non_zero_exit_raises_with_stderr` |
+| S2 | Tesseract binary missing at a configured path | reason "tesseract not available on this server"; path only in logs | `ImageOcrServiceTest › missing_binary_is_failed_with_reason`, `CliTesseractRunnerTest › missing_binary_raises_unavailable` |
+| S3 | Temp workspace unusable | reason names the failure, not the host path | `ImageOcrServiceTest › unusable_temp_root_is_failed_with_reason` |
+| S4 | Unexpected exception in the consumer | reason is a generic internal-error note; detail kept in the log and DLQ entry | `UploadFinalizedConsumerTest › unexpected_exception_marks_failed_and_dead_letters` |
+
 ## Out of scope / follow-ups
 
 - Mobile (Flutter) is not installed here: the generated Dart client needs no change (no OpenAPI change in this slice); copy updates for the mobile OCR badge are a mobile follow-up.

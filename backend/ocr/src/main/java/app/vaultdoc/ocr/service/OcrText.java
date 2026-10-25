@@ -1,6 +1,9 @@
 package app.vaultdoc.ocr.service;
 
+import app.vaultdoc.ocr.tesseract.TesseractException;
+
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileSystemException;
 
 /** Small text helpers shared by the OCR engines. */
 final class OcrText {
@@ -31,7 +34,18 @@ final class OcrText {
         return (int) text.codePoints().filter(c -> !Character.isWhitespace(c)).count();
     }
 
+    /**
+     * A failure message fit for {@code ocrFailureReason}: tesseract errors use
+     * their {@link TesseractException#userMessage() user message} and
+     * filesystem errors drop the path, so stderr and host paths stay in logs.
+     */
     static String summarize(Throwable t) {
+        if (t instanceof TesseractException te) return te.userMessage();
+        if (t instanceof FileSystemException fse) {
+            return fse.getReason() == null
+                    ? fse.getClass().getSimpleName()
+                    : fse.getClass().getSimpleName() + ": " + fse.getReason();
+        }
         String message = t.getMessage();
         if (message == null) return t.getClass().getSimpleName();
         if (message.length() > 300) return message.substring(0, 300) + "…";

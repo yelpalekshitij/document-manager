@@ -69,7 +69,9 @@ class CliTesseractRunnerTest {
         assertThatThrownBy(() -> runner.recognize(image, List.of("eng")))
                 .isExactlyInstanceOf(TesseractException.class)
                 .hasMessageContaining("exit code 1")
-                .hasMessageContaining("Unknown format");
+                .hasMessageContaining("Unknown format")
+                .satisfies(e -> assertThat(((TesseractException) e).userMessage())
+                        .contains("exit code 1").doesNotContain("Unknown format"));
     }
 
     @Test
@@ -99,7 +101,9 @@ class CliTesseractRunnerTest {
 
         assertThatThrownBy(() -> runner.recognize(image, List.of("eng")))
                 .isInstanceOf(TesseractUnavailableException.class)
-                .hasMessageContaining("no-such-tesseract");
+                .hasMessageContaining("no-such-tesseract")
+                .satisfies(e -> assertThat(((TesseractException) e).userMessage())
+                        .contains("tesseract not available").doesNotContain("no-such-tesseract"));
         assertThatThrownBy(runner::listLanguages).isInstanceOf(TesseractUnavailableException.class);
     }
 

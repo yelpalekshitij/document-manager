@@ -4,6 +4,6 @@ package app.vaultdoc.ocr.tesseract;
 public class TesseractUnavailableException extends TesseractException {
 
     public TesseractUnavailableException(String message, Throwable cause) {
-        super(message, cause);
+        super(message, "tesseract not available on this server", cause);
     }
 }

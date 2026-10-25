@@ -144,7 +144,9 @@ public class UploadFinalizedConsumer implements StreamListener<String, MapRecord
 
     private void safelyMarkFailed(UUID documentId, Exception cause) {
         try {
-            documents.markOcr(documentId, OcrStatus.FAILED, null, null, summarize(cause));
+            // The cause's message can name hosts, SQL or paths: it goes to the log and
+            // the DLQ entry, never to the user-visible reason.
+            documents.markOcr(documentId, OcrStatus.FAILED, null, null, INTERNAL_FAILURE_REASON);
         } catch (Exception nested) {
             log.warn("Failed to write OCR_FAILED status for {}", documentId, nested);
         }
@@ -169,6 +171,8 @@ public class UploadFinalizedConsumer implements StreamListener<String, MapRecord
             log.warn("Failed to XACK entry {}: {}", recordId, e.toString());
         }
     }
+
+    static final String INTERNAL_FAILURE_REASON = "OCR failed because of an internal error";
 
     private static String summarize(Throwable t) {
         String message = t.getMessage();

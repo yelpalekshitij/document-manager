@@ -101,7 +101,7 @@ class UploadFinalizedConsumerTest {
 
         consumer.onMessage(record("3-0"));
 
-        verify(documents).markOcr(documentId, OcrStatus.FAILED, null, null, "engine exploded");
+        verify(documents).markOcr(documentId, OcrStatus.FAILED, null, null, "OCR failed because of an internal error");
         @SuppressWarnings("unchecked")
         ArgumentCaptor<Map<String, String>> dlq = ArgumentCaptor.forClass(Map.class);
         verify(publisher).publish(eq(StreamNames.UPLOAD_FINALIZED_DLQ), dlq.capture());
