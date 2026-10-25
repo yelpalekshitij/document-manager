@@ -128,6 +128,15 @@ class ElasticsearchSearchServiceTagIT {
     }
 
     @Test
+    void tagNames_matchQueryCaseInsensitively() {
+        UUID a = indexDoc("scan-002.pdf", null);
+        search.updateTags(userId, List.of(new DocumentTagsUpdate(a, List.of(tax), List.of("Tax Returns"))));
+
+        assertThat(ids(search.search(userId, "tax returns", null, Set.of(), 0, 10))).containsExactly(a);
+        assertThat(ids(search.search(userId, "TAX RETURNS", null, Set.of(), 0, 10))).containsExactly(a);
+    }
+
+    @Test
     void reindex_preservesTags() {
         UUID a = indexDoc("a.pdf", null);
         tag(a, tax);

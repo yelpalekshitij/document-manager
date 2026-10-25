@@ -158,6 +158,7 @@ Test locations (abbreviations used below):
 | S16 | ES down during sync → tag change still committed, request succeeds, error logged | unit | `SyncTest.onTagsChanged_searchFailure_isSwallowed` |
 | S17 | Search `tagIds` > 20 → 400; duplicates deduped before reaching ES | contract | `TagContractTest.search_tooManyTagFilters_400`, `TagContractTest.search_passesDedupedTagFilter` |
 | S18 | Tag names stay matchable by free-text query | ES IT | `EsTagIT.tagNames_areSearchableByQuery` |
+| S18a | Free-text query matches a tag name regardless of case | ES IT | `EsTagIT.tagNames_matchQueryCaseInsensitively` |
 | S19 | `updateTags` with an empty tag list clears tag fields; empty batch is a no-op | ES IT | `EsTagIT.updateTags_emptyListClearsTags`, `EsTagIT.updateTags_emptyBatch_isNoop` |
 | S20 | Untagged doc at finalize → no ES round trip | unit | `SyncTest.onFinalized_untaggedDocument_noSearchCall` |
 | S21 | Catalog read failure during sync is swallowed (logged) | unit | `SyncTest.onTagsChanged_catalogFailure_isSwallowed` |

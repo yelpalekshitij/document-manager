@@ -140,7 +140,7 @@ public class ElasticsearchSearchService implements SearchService {
                     .should(s -> s.match(m -> m.field("filename").query(trimmed)))
                     .should(s -> s.wildcard(w -> w.field("filename.raw").value("*" + trimmed.toLowerCase() + "*")))
                     .should(s -> s.term(t -> t.field("documentType").value(trimmed)))
-                    .should(s -> s.term(t -> t.field("tags").value(trimmed)))
+                    .should(s -> s.term(t -> t.field("tags").value(trimmed).caseInsensitive(true)))
                     .should(s -> s.match(m -> m.field("ocrText").query(trimmed)))
                     .minimumShouldMatch("1")));
         } else {
