@@ -37,7 +37,14 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.parallel.Execution;
 import org.junit.jupiter.api.parallel.ExecutionMode;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
+import org.springframework.data.redis.connection.stream.Consumer;
+import org.springframework.data.redis.connection.stream.ReadOffset;
+import org.springframework.data.redis.connection.stream.StreamOffset;
+import org.springframework.data.redis.connection.stream.StreamReadOptions;
+import org.springframework.data.redis.core.StringRedisTemplate;
+import org.springframework.data.redis.stream.StreamMessageListenerContainer;
 import org.springframework.http.MediaType;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
@@ -53,8 +60,12 @@ import static org.springframework.test.web.servlet.request.MockMvcRequestBuilder
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.jsonPath;
 import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.status;
 
+import app.vaultdoc.catalog.service.DocumentService;
+import app.vaultdoc.core.pipeline.stream.StreamNames;
 import app.vaultdoc.gateway.support.DocumentITBase;
 import app.vaultdoc.gateway.support.RecordingEmailSender;
+import app.vaultdoc.ocr.config.OcrProperties;
+import app.vaultdoc.ocr.consumer.PendingEntryReclaimer;
 
 @AutoConfigureMockMvc
 @Execution(ExecutionMode.SAME_THREAD)
@@ -68,11 +79,92 @@ class OcrPipelineIT extends DocumentITBase {
         registry.add("spring.data.redis.password", () -> "");
         // Gradle daemons don't always inherit the interactive PATH (e.g. /opt/homebrew/bin).
         TESSERACT.ifPresent(path -> registry.add("vaultdoc.ocr.tesseract-path", () -> path));
+        // Reclaim tests drive sweeps by hand: tiny idle threshold, no background sweeps.
+        registry.add("vaultdoc.ocr.reclaim-min-idle", () -> "1s");
+        registry.add("vaultdoc.ocr.reclaim-interval", () -> "1h");
     }
 
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper json;
     @Autowired RecordingEmailSender mail;
+    @Autowired StringRedisTemplate redis;
+    @Autowired PendingEntryReclaimer reclaimer;
+    @Autowired OcrProperties ocrProperties;
+    @Autowired DocumentService documentService;
+    @Autowired @Qualifier("ocrStreamListenerContainer") StreamMessageListenerContainer<?, ?> ocrListener;
+
+    // ── stranded stream entries (worker died mid-job) ────────────────────────
+
+    @Test
+    void pending_entry_of_dead_consumer_is_reclaimed() throws Exception {
+        String token = registerVerifyAndLogin();
+        String documentId = strandEntry(token, "orphan.pdf", "Orphaned lease agreement for flat 4B", 1);
+        assertEquals("PROCESSING", getJsonAuth("/api/v1/documents/" + documentId, token).get("ocrStatus").asString());
+
+        awaitIdleThenReclaim();
+
+        JsonNode detail = awaitOcr(documentId, token, "DONE");
+        assertTrue(detail.get("ocrText").asString().contains("Orphaned lease"), "ocrText: " + detail.get("ocrText"));
+        assertEquals(0L, pendingCount(), "the reclaimed entry must be acked");
+    }
+
+    @Test
+    void entry_redelivered_too_often_is_dead_lettered() throws Exception {
+        String token = registerVerifyAndLogin();
+        long dlqBefore = streamLength(StreamNames.UPLOAD_FINALIZED_DLQ);
+        String documentId = strandEntry(token, "poison.pdf", "This file keeps crashing the worker", ocrProperties.maxDeliveries());
+
+        awaitIdleThenReclaim();
+
+        JsonNode detail = awaitOcr(documentId, token, "FAILED");
+        assertTrue(detail.get("ocrFailureReason").asString().contains("delivery attempts"), "reason: " + detail);
+        assertEquals(0L, pendingCount(), "the poison entry must be acked");
+        assertEquals(dlqBefore + 1, streamLength(StreamNames.UPLOAD_FINALIZED_DLQ));
+    }
+
+    /**
+     * Upload with the live listener paused, then let a "dead" consumer read the
+     * entry {@code deliveries} times without acking — as if its JVM died mid-OCR.
+     */
+    private String strandEntry(String token, String filename, String text, int deliveries) throws Exception {
+        ocrListener.stop();
+        try {
+            // Let an in-flight XREADGROUP (≤ pollTimeout) finish so it can't grab our entry.
+            Awaitility.await().pollDelay(ocrProperties.pollTimeout().plusMillis(500)).until(() -> true);
+            String documentId = uploadAndFinalize(token, filename, "application/pdf", newPdfWithText(text));
+            Consumer dead = Consumer.from(ocrProperties.consumerGroup(), "ocr-dead-worker-" + UUID.randomUUID());
+            var taken = redis.opsForStream().read(dead, StreamReadOptions.empty().count(10),
+                    StreamOffset.create(StreamNames.UPLOAD_FINALIZED, ReadOffset.lastConsumed()));
+            assertTrue(taken.stream().anyMatch(r -> documentId.equals(String.valueOf(r.getValue().get("documentId")))),
+                    "dead worker should have taken the entry: " + taken);
+            for (int i = 1; i < deliveries; i++) {
+                // Re-reading its own pending entries ("0") is a redelivery: bumps the count.
+                redis.opsForStream().read(dead, StreamReadOptions.empty().count(10),
+                        StreamOffset.create(StreamNames.UPLOAD_FINALIZED, ReadOffset.from("0")));
+            }
+            documentService.markOcrProcessing(UUID.fromString(documentId));
+            return documentId;
+        } finally {
+            ocrListener.start();
+        }
+    }
+
+    private void awaitIdleThenReclaim() {
+        Awaitility.await()
+                .atMost(Duration.ofSeconds(30))
+                .pollInterval(Duration.ofMillis(300))
+                .until(() -> reclaimer.reclaim() > 0);
+    }
+
+    private long pendingCount() {
+        return redis.opsForStream().pending(StreamNames.UPLOAD_FINALIZED, ocrProperties.consumerGroup())
+                .getTotalPendingMessages();
+    }
+
+    private long streamLength(String stream) {
+        Long size = redis.opsForStream().size(stream);
+        return size == null ? 0 : size;
+    }
 
     @Test
     void pdf_upload_triggers_ocr_and_text_is_searchable() throws Exception {
@@ -125,7 +217,7 @@ class OcrPipelineIT extends DocumentITBase {
 
     @Test
     void png_upload_is_ocrd_and_text_is_searchable() throws Exception {
-        assumeTrue(TESSERACT.isPresent(), "tesseract not installed — skipping real-engine IT");
+        requireTesseract();
         String token = registerVerifyAndLogin();
         byte[] png = png(textImage("INVOICE PAID", 1400, 220));
 
@@ -145,7 +237,7 @@ class OcrPipelineIT extends DocumentITBase {
 
     @Test
     void scanned_pdf_is_ocrd_via_fallback() throws Exception {
-        assumeTrue(TESSERACT.isPresent(), "tesseract not installed — skipping real-engine IT");
+        requireTesseract();
         String token = registerVerifyAndLogin();
         byte[] scanned = imageOnlyPdf(textImage("LEASE DEED", 500, 100));
 
@@ -215,7 +307,7 @@ class OcrPipelineIT extends DocumentITBase {
 
     @Test
     void tagged_image_keeps_tags_after_tesseract_reindex() throws Exception {
-        assumeTrue(TESSERACT.isPresent(), "tesseract not installed — skipping real-engine IT");
+        requireTesseract();
         String token = registerVerifyAndLogin();
         String tagId = createTag(token, "receipts");
         byte[] png = png(textImage("ZEBRAFISH TOTAL", 1400, 220));
@@ -331,6 +423,20 @@ class OcrPipelineIT extends DocumentITBase {
             doc.save(out);
             return out.toByteArray();
         }
+    }
+
+    /**
+     * Skips a real-engine test when tesseract isn't installed — unless
+     * {@code CI_REQUIRE_TESSERACT=true} (set by CI after installing it), where a
+     * missing binary must fail the build rather than turn into a green skip.
+     */
+    private static void requireTesseract() {
+        if (TESSERACT.isPresent()) return;
+        String required = System.getenv("CI_REQUIRE_TESSERACT");
+        if (required != null && required.strip().equalsIgnoreCase("true")) {
+            org.junit.jupiter.api.Assertions.fail("CI_REQUIRE_TESSERACT=true but no tesseract binary was found");
+        }
+        assumeTrue(false, "tesseract not installed — skipping real-engine IT");
     }
 
     private static Optional<String> locateTesseract() {

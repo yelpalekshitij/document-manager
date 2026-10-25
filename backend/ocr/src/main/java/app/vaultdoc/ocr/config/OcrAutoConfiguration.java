@@ -26,6 +26,7 @@ import app.vaultdoc.core.pipeline.stream.StreamConsumerSupport;
 import app.vaultdoc.core.pipeline.stream.StreamNames;
 import app.vaultdoc.core.pipeline.stream.StreamPublisher;
 import app.vaultdoc.core.storage.ObjectStorage;
+import app.vaultdoc.ocr.consumer.PendingEntryReclaimer;
 import app.vaultdoc.ocr.consumer.UploadFinalizedConsumer;
 import app.vaultdoc.ocr.service.ImageOcrService;
 import app.vaultdoc.ocr.service.OcrService;
@@ -80,9 +81,12 @@ public class OcrAutoConfiguration {
                         properties.pdfOcrDpi(),
                         properties.maxImagePixels(),
                         properties.pdfMinTextCharsPerPage(),
-                        tempRoot)
+                        tempRoot,
+                        properties.documentOcrBudget(),
+                        null)
                 : null;
-        OcrService pdf = new PdfBoxOcrService(storage, properties.extractedTextLimitBytes(), fallback);
+        OcrService pdf = new PdfBoxOcrService(
+                storage, properties.extractedTextLimitBytes(), fallback, properties.pdfMaxPages());
         OcrService image = new ImageOcrService(
                 storage,
                 runner,
@@ -90,7 +94,10 @@ public class OcrAutoConfiguration {
                 properties.maxImageBytes(),
                 properties.maxImagePixels(),
                 properties.extractedTextLimitBytes(),
-                tempRoot);
+                tempRoot,
+                properties.maxImageFrames(),
+                properties.documentOcrBudget(),
+                null);
         return new RoutingOcrService(pdf, image);
     }
 
@@ -111,13 +118,51 @@ public class OcrAutoConfiguration {
                 documents, ocr, search, publisher, redis, properties.consumerGroup());
     }
 
+    /**
+     * This process's consumer name in the group — resolved once, so the
+     * listener and the reclaimer act as the same consumer.
+     */
+    public record OcrConsumerName(String value) {}
+
+    @Bean
+    @ConditionalOnMissingBean
+    OcrConsumerName ocrConsumerName(OcrProperties properties) {
+        return new OcrConsumerName(properties.resolvedConsumerName());
+    }
+
+    /** Sweeps for entries stranded in a dead consumer's pending list (see {@link PendingEntryReclaimer}). */
+    @Bean(destroyMethod = "stop")
+    @ConditionalOnMissingBean
+    PendingEntryReclaimer pendingEntryReclaimer(
+            StringRedisTemplate redis,
+            UploadFinalizedConsumer consumer,
+            OcrProperties properties,
+            OcrConsumerName consumerName) {
+        if (properties.reclaimMinIdle().compareTo(properties.documentOcrBudget()) <= 0) {
+            log.warn("vaultdoc.ocr.reclaim-min-idle ({}) is not above document-ocr-budget ({}): "
+                    + "long-running OCR jobs may be claimed and processed twice",
+                    properties.reclaimMinIdle(), properties.documentOcrBudget());
+        }
+        PendingEntryReclaimer reclaimer = new PendingEntryReclaimer(
+                redis,
+                consumer,
+                properties.consumerGroup(),
+                consumerName.value(),
+                properties.reclaimMinIdle(),
+                properties.maxDeliveries(),
+                properties.batchSize());
+        reclaimer.start(properties.reclaimInterval());
+        return reclaimer;
+    }
+
     @Bean(destroyMethod = "stop")
     @ConditionalOnMissingBean(name = "ocrStreamListenerContainer")
     StreamMessageListenerContainer<String, MapRecord<String, String, String>> ocrStreamListenerContainer(
             RedisConnectionFactory connectionFactory,
             StringRedisTemplate redis,
             UploadFinalizedConsumer consumer,
-            OcrProperties properties) {
+            OcrProperties properties,
+            OcrConsumerName ocrConsumerName) {
 
         // Make sure the stream + consumer group exist before we subscribe.
         StreamConsumerSupport.ensureGroupExists(
@@ -138,7 +183,7 @@ public class OcrAutoConfiguration {
         StreamMessageListenerContainer<String, MapRecord<String, String, String>> container =
                 StreamMessageListenerContainer.create(connectionFactory, options);
 
-        String consumerName = properties.resolvedConsumerName();
+        String consumerName = ocrConsumerName.value();
         Consumer consumerRef = Consumer.from(properties.consumerGroup(), consumerName);
         StreamOffset<String> offset = StreamOffset.create(
                 StreamNames.UPLOAD_FINALIZED, ReadOffset.lastConsumed());
@@ -171,7 +216,8 @@ public class OcrAutoConfiguration {
 
         @PostConstruct void onInit() {
             log.info("OCR pipeline initialized: group={} pollTimeout={} batchSize={} extractedTextLimit={} "
-                            + "tesseract={} languages={} timeout={} pdfFallback={} (maxPages={}, dpi={})",
+                            + "tesseract={} languages={} timeout={} pdfFallback={} (maxPages={}, dpi={}) "
+                            + "documentBudget={} maxImageFrames={} pdfMaxPages={} reclaimMinIdle={}",
                     properties.consumerGroup(),
                     properties.pollTimeout(),
                     properties.batchSize(),
@@ -181,7 +227,11 @@ public class OcrAutoConfiguration {
                     properties.tesseractTimeout(),
                     properties.pdfOcrFallbackEnabled(),
                     properties.pdfOcrMaxPages(),
-                    properties.pdfOcrDpi());
+                    properties.pdfOcrDpi(),
+                    properties.documentOcrBudget(),
+                    properties.maxImageFrames(),
+                    properties.pdfMaxPages(),
+                    properties.reclaimMinIdle());
             // Probe once at boot so a missing binary / language pack shows up in
             // the startup log, not only on the first image upload. Never fatal:
             // PDFs with a text layer still work without tesseract.

@@ -30,6 +30,7 @@ import org.junit.jupiter.api.parallel.ExecutionMode;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.webmvc.test.autoconfigure.AutoConfigureMockMvc;
 import org.springframework.http.MediaType;
+import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.test.context.DynamicPropertyRegistry;
 import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.test.web.servlet.MockMvc;
@@ -69,6 +70,7 @@ class TagFlowIT extends DocumentITBase {
     @Autowired MockMvc mvc;
     @Autowired ObjectMapper json;
     @Autowired RecordingEmailSender mail;
+    @Autowired JdbcTemplate jdbc;
 
     // ── CRUD ────────────────────────────────────────────────────────────────
 
@@ -149,6 +151,54 @@ class TagFlowIT extends DocumentITBase {
                 .content("{\"name\":\"Tax\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.name").value("Tax"));
+    }
+
+    @Test
+    void conflicts_whitespaceAndNormalisationVariants_409() throws Exception {
+        String token = registerVerifyAndLogin();
+        createTag(token, "Tax 2024");
+        String bills = createTag(token, "Bills");
+        createTag(token, "\u00c4rzte");                       // precomposed Ä (NFC)
+
+        // Normalised (NFC + whitespace collapse + trim) *before* the conflict lookup.
+        expectProblem(as(token, post("/api/v1/tags").contentType(MediaType.APPLICATION_JSON)
+                .content(nameJson("  tax\t 2024 "))), 409, "tag-name-conflict");
+        expectProblem(as(token, patch("/api/v1/tags/" + bills).contentType(MediaType.APPLICATION_JSON)
+                .content(nameJson("TAX  2024"))), 409, "tag-name-conflict");
+        expectProblem(as(token, post("/api/v1/tags").contentType(MediaType.APPLICATION_JSON)
+                .content(nameJson("A\u0308rzte"))), 409, "tag-name-conflict");   // decomposed A + ¨
+        as(token, get("/api/v1/tags")).andExpect(jsonPath("$.tags.length()").value(3));
+    }
+
+    @Test
+    void concurrentCreate_atUserCap_neverExceeds500() throws Exception {
+        String token = registerVerifyAndLogin();
+        String first = createTag(token, "seed-0");
+        UUID userId = jdbc.queryForObject("select user_id from tags where id = ?", UUID.class, UUID.fromString(first));
+        List<Object[]> rows = new ArrayList<>();
+        for (int i = 1; i < 499; i++) rows.add(new Object[] {userId, "seed-" + i});
+        jdbc.batchUpdate("insert into tags (user_id, name) values (?, ?)", rows);
+
+        int attempts = 4;
+        ExecutorService pool = Executors.newFixedThreadPool(attempts);
+        List<Integer> statuses = new ArrayList<>();
+        try {
+            List<Callable<Integer>> calls = new ArrayList<>();
+            for (int i = 0; i < attempts; i++) {
+                String name = "racer-" + i;
+                calls.add(() -> as(token, post("/api/v1/tags").contentType(MediaType.APPLICATION_JSON)
+                        .content(nameJson(name))).andReturn().getResponse().getStatus());
+            }
+            for (Future<Integer> f : pool.invokeAll(calls)) statuses.add(f.get());
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(statuses).containsOnly(201, 409);
+        assertThat(statuses).filteredOn(s -> s == 201).hasSize(1);
+        assertThat(jdbc.queryForObject("select count(*) from tags where user_id = ?", Long.class, userId)).isEqualTo(500L);
+        expectProblem(as(token, post("/api/v1/tags").contentType(MediaType.APPLICATION_JSON)
+                .content(nameJson("one-too-many"))), 409, "tag-limit-reached");
     }
 
     @Test
@@ -256,6 +306,82 @@ class TagFlowIT extends DocumentITBase {
     }
 
     @Test
+    void addTag_beyond50_400_butAlreadyAttachedAt50_200() throws Exception {
+        String token = registerVerifyAndLogin();
+        String doc = upload(token, "busy.png", null);
+        List<String> fifty = new ArrayList<>();
+        for (int i = 0; i < 50; i++) fifty.add(createTag(token, "t" + i));
+        String extra = createTag(token, "t50");
+        setTags(token, doc, fifty.toArray(String[]::new));
+
+        expectProblem(as(token, put("/api/v1/documents/" + doc + "/tags/" + extra)), 400, "invalid-tag");
+        as(token, put("/api/v1/documents/" + doc + "/tags/" + fifty.get(7)))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.tags.length()").value(50));
+
+        // The document's own tag set still round-trips through the bulk endpoint.
+        setTags(token, doc, fifty.toArray(String[]::new));
+        as(token, get("/api/v1/documents/" + doc)).andExpect(jsonPath("$.tags.length()").value(50));
+    }
+
+    @Test
+    void concurrentAdd_atDocumentCap_neverExceeds50() throws Exception {
+        String token = registerVerifyAndLogin();
+        String doc = upload(token, "contended.png", null);
+        List<String> attached = new ArrayList<>();
+        for (int i = 0; i < 49; i++) attached.add(createTag(token, "base" + i));
+        setTags(token, doc, attached.toArray(String[]::new));
+        List<String> racers = new ArrayList<>();
+        for (int i = 0; i < 4; i++) racers.add(createTag(token, "racer" + i));
+
+        ExecutorService pool = Executors.newFixedThreadPool(racers.size());
+        List<Integer> statuses = new ArrayList<>();
+        try {
+            List<Callable<Integer>> calls = new ArrayList<>();
+            for (String tag : racers) {
+                calls.add(() -> as(token, put("/api/v1/documents/" + doc + "/tags/" + tag))
+                        .andReturn().getResponse().getStatus());
+            }
+            for (Future<Integer> f : pool.invokeAll(calls)) statuses.add(f.get());
+        } finally {
+            pool.shutdownNow();
+        }
+
+        assertThat(statuses).containsOnly(200, 400);
+        assertThat(statuses).filteredOn(s -> s == 200).hasSize(1);
+        as(token, get("/api/v1/documents/" + doc)).andExpect(jsonPath("$.tags.length()").value(50));
+    }
+
+    @Test
+    void concurrentDeleteAndAdd_neverReturns500() throws Exception {
+        String token = registerVerifyAndLogin();
+        List<String> docs = new ArrayList<>();
+        for (int i = 0; i < 4; i++) docs.add(upload(token, "victim-" + i + ".png", null));
+        ExecutorService pool = Executors.newFixedThreadPool(docs.size() + 1);
+        try {
+            for (int round = 0; round < 5; round++) {
+                String tag = createTag(token, "doomed-" + round);
+                List<Callable<Integer>> calls = new ArrayList<>();
+                for (String doc : docs) {
+                    calls.add(() -> as(token, put("/api/v1/documents/" + doc + "/tags/" + tag))
+                            .andReturn().getResponse().getStatus());
+                }
+                calls.add(() -> as(token, delete("/api/v1/tags/" + tag)).andReturn().getResponse().getStatus());
+                List<Integer> statuses = new ArrayList<>();
+                for (Future<Integer> f : pool.invokeAll(calls)) statuses.add(f.get());
+
+                assertThat(statuses.subList(0, docs.size())).as("round %d adds", round).isSubsetOf(200, 404);
+                assertThat(statuses.getLast()).as("round %d delete", round).isEqualTo(204);
+            }
+        } finally {
+            pool.shutdownNow();
+        }
+        for (String doc : docs) {
+            as(token, get("/api/v1/documents/" + doc)).andExpect(jsonPath("$.tags.length()").value(0));
+        }
+    }
+
+    @Test
     void crossTenant_sameNameAllowed_andForeignTagIsNotFound() throws Exception {
         String alice = registerVerifyAndLogin();
         String bob = registerVerifyAndLogin();
@@ -312,6 +438,30 @@ class TagFlowIT extends DocumentITBase {
         assertThat(listIds(token, folder, tax, paid)).containsExactly(inFolderBoth);
         as(token, get("/api/v1/documents").param("tagIds", tax, paid))
                 .andExpect(jsonPath("$.totalCount").value(2));
+    }
+
+    @Test
+    void listFilter_paginates() throws Exception {
+        String token = registerVerifyAndLogin();
+        String tag = createTag(token, "paged");
+        String oldest = upload(token, "p1.png", null);
+        String middle = upload(token, "p2.png", null);
+        upload(token, "untagged.png", null);
+        String newest = upload(token, "p3.png", null);
+        setTags(token, oldest, tag);
+        setTags(token, middle, tag);
+        setTags(token, newest, tag);
+
+        JsonNode page0 = body(as(token, get("/api/v1/documents").param("tagIds", tag)
+                .param("page", "0").param("pageSize", "2")).andExpect(status().isOk()));
+        JsonNode page1 = body(as(token, get("/api/v1/documents").param("tagIds", tag)
+                .param("page", "1").param("pageSize", "2")).andExpect(status().isOk()));
+
+        assertThat(ids(page0)).containsExactly(newest, middle);     // newest first
+        assertThat(ids(page1)).containsExactly(oldest);
+        assertThat(page0.get("totalCount").asLong()).isEqualTo(3);
+        assertThat(page1.get("totalCount").asLong()).isEqualTo(3);
+        assertThat(page1.get("page").asInt()).isEqualTo(1);
     }
 
     @Test
@@ -403,6 +553,25 @@ class TagFlowIT extends DocumentITBase {
     }
 
     @Test
+    void deleteTag_onManyDocs_reindexesAll() throws Exception {
+        String token = registerVerifyAndLogin();
+        String doomed = createTag(token, "Shredded");
+        List<String> docs = new ArrayList<>();
+        for (int i = 0; i < 4; i++) docs.add(upload(token, "bulk-" + i + ".png", null));
+        for (String doc : docs) setTags(token, doc, doomed);
+        assertThat(searchIds(token, null, doomed)).containsExactlyInAnyOrderElementsOf(docs);
+        assertThat(searchIds(token, "Shredded")).containsExactlyInAnyOrderElementsOf(docs);
+
+        as(token, delete("/api/v1/tags/" + doomed)).andExpect(status().isNoContent());
+
+        assertThat(searchIds(token, null, doomed)).isEmpty();
+        assertThat(searchIds(token, "Shredded")).isEmpty();
+        for (String doc : docs) {
+            as(token, get("/api/v1/documents/" + doc)).andExpect(jsonPath("$.tags.length()").value(0));
+        }
+    }
+
+    @Test
     void tagBeforeFinalize_tagsReachSearchAfterFinalize() throws Exception {
         String token = registerVerifyAndLogin();
         String tag = createTag(token, "early");
@@ -458,6 +627,16 @@ class TagFlowIT extends DocumentITBase {
         return body(as(token, post("/api/v1/tags").contentType(MediaType.APPLICATION_JSON)
                 .content("{\"name\":\"" + name + "\"}"))
                 .andExpect(status().isCreated())).get("id").asString();
+    }
+
+    private String nameJson(String name) {
+        return json.writeValueAsString(java.util.Map.of("name", name));
+    }
+
+    private static List<String> ids(JsonNode page) {
+        List<String> ids = new ArrayList<>();
+        page.get("items").forEach(n -> ids.add(n.get("id").asString()));
+        return ids;
     }
 
     private String createFolder(String token, String name) throws Exception {

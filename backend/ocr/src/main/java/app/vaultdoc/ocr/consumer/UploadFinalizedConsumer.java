@@ -89,6 +89,31 @@ public class UploadFinalizedConsumer implements StreamListener<String, MapRecord
         }
     }
 
+    /**
+     * Give up on an entry without running OCR: mark the document {@code FAILED}
+     * with {@code reason}, copy the entry to the DLQ, and XACK it. Used for
+     * poison entries the {@link PendingEntryReclaimer} has seen redelivered too
+     * often.
+     */
+    public void deadLetter(MapRecord<String, String, String> record, String reason) {
+        Map<String, String> raw = record.getValue();
+        UUID documentId = null;
+        try {
+            documentId = PipelineEvent.fromMap(raw).documentId();
+        } catch (RuntimeException malformed) {
+            log.warn("Dead-lettering malformed OCR entry {}: {}", record.getId(), malformed.toString());
+        }
+        if (documentId != null) {
+            try {
+                documents.markOcr(documentId, OcrStatus.FAILED, null, null, reason);
+            } catch (Exception e) {
+                log.warn("Failed to write OCR_FAILED status for {}", documentId, e);
+            }
+        }
+        publishDlq(raw, new IllegalStateException(reason));
+        ack(record.getId());
+    }
+
     private void handle(PipelineEvent event) {
         documents.markOcrProcessing(event.documentId());
         OcrResult result = ocr.extract(new StorageKey(event.storageKey()), event.mimeType());

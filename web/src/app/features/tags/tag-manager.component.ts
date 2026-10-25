@@ -1,5 +1,6 @@
 import {
   Component,
+  DestroyRef,
   ElementRef,
   Injector,
   afterNextRender,
@@ -191,6 +192,11 @@ export class TagManagerComponent {
 
   constructor() {
     this.tags.clearError();
+    // Whatever opened the dialog (the sidebar's "Manage" button) gets focus back on close.
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    inject(DestroyRef).onDestroy(() => {
+      if (opener?.isConnected) opener.focus();
+    });
     afterNextRender(() => this.nameInput()?.nativeElement.focus());
   }
 
@@ -257,12 +263,36 @@ export class TagManagerComponent {
   }
 
   onKeydown(event: KeyboardEvent): void {
+    if (event.key === 'Tab') {
+      this.trapFocus(event);
+      return;
+    }
     if (event.key !== 'Escape') return;
     if (this.confirmingId() !== null) {
       this.confirmingId.set(null);
       return;
     }
     this.close.emit();
+  }
+
+  /** aria-modal promises focus stays inside: wrap Tab at the ends of the dialog. */
+  private trapFocus(event: KeyboardEvent): void {
+    const panel = this.host.nativeElement.querySelector<HTMLElement>('[role="dialog"]');
+    if (!panel) return;
+    const items = Array.from(
+      panel.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled])'),
+    );
+    if (items.length === 0) return;
+    const first = items[0];
+    const last = items[items.length - 1];
+    const active = document.activeElement;
+    if (event.shiftKey && active === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && active === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
 
   onBackdrop(event: MouseEvent): void {

@@ -58,6 +58,12 @@ import { TagChipsComponent } from '../tags/tag-chips.component';
                 @if (d.ocrPageCount) {
                   <p class="muted">{{ d.ocrPageCount }} page(s)</p>
                 }
+                @if (d.ocrFailureReason) {
+                  <!-- DONE but incomplete (page cap, time budget, a page that failed): say what's missing. -->
+                  <p class="ocr-note" role="status">
+                    <strong>Partly searchable.</strong> {{ d.ocrFailureReason }}
+                  </p>
+                }
               } @else if (d.ocrStatus === 'PROCESSING' || d.ocrStatus === 'PENDING') {
                 <p class="muted">Extraction in progress — refresh in a moment.</p>
               } @else if (d.ocrStatus === 'SKIPPED') {
@@ -120,6 +126,10 @@ import { TagChipsComponent } from '../tags/tag-chips.component';
       .error { color: var(--vd-danger); }
       .ocr-body .error, .ocr-body .muted { padding: 0.5rem 0; text-align: left; }
       .ocr-body .reason { display: block; margin-top: 0.25rem; font-size: 0.8rem; }
+      .ocr-note {
+        margin: 0.5rem 0 0; padding: 0.4rem 0.6rem; font-size: 0.8rem;
+        border-left: 3px solid var(--vd-warning, #c69026); color: var(--vd-fg);
+      }
       .ocr-panel {
         border-top: 1px solid var(--vd-border);
         max-height: 35%;

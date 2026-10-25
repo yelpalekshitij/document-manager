@@ -79,6 +79,13 @@ public interface DocumentRepository extends JpaRepository<Document, UUID> {
 
     long countByUserIdAndFolderId(UUID userId, UUID folderId);
 
+    /**
+     * Row lock on the document for the rest of the transaction. Serialises tag
+     * assignment per document, so the 50-tags cap holds under concurrent adds.
+     */
+    @Query(value = "select cast(id as varchar) from documents where id = :id for update", nativeQuery = true)
+    Optional<String> lockForTagging(@Param("id") UUID id);
+
     /** Subset of {@code ids} that belong to the user and are READY (i.e. present in the search index). */
     @Query("""
             select d.id from Document d

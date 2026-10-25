@@ -34,6 +34,33 @@ class OcrPropertiesTest {
         assertThat(p.pdfOcrDpi()).isEqualTo(300);
         assertThat(p.pdfMinTextCharsPerPage()).isEqualTo(25);
         assertThat(p.tempDir()).isNull();
+
+        // Review fixes: hard bounds on a single document + stranded-entry recovery.
+        assertThat(p.maxImageFrames()).isEqualTo(20);
+        assertThat(p.pdfMaxPages()).isEqualTo(2_000);
+        assertThat(p.documentOcrBudget()).isEqualTo(Duration.ofMinutes(10));
+        assertThat(p.reclaimMinIdle()).isEqualTo(Duration.ofMinutes(30));
+        assertThat(p.reclaimInterval()).isEqualTo(Duration.ofMinutes(1));
+        assertThat(p.maxDeliveries()).isEqualTo(3);
+    }
+
+    @Test
+    void new_bounds_fall_back_to_defaults_when_out_of_range() {
+        OcrProperties p = OcrProperties.defaults()
+                .withMaxImageFrames(0)
+                .withPdfMaxPages(-1)
+                .withDocumentOcrBudget(Duration.ofSeconds(-5))
+                .withReclaimMinIdle(Duration.ZERO)
+                .withReclaimInterval(null)
+                .withMaxDeliveries(0);
+
+        assertThat(p.maxImageFrames()).isEqualTo(20);
+        assertThat(p.pdfMaxPages()).isEqualTo(2_000);
+        assertThat(p.documentOcrBudget()).isEqualTo(Duration.ofMinutes(10));
+        assertThat(p.reclaimMinIdle()).isEqualTo(Duration.ofMinutes(30));
+        assertThat(p.reclaimInterval()).isEqualTo(Duration.ofMinutes(1));
+        assertThat(p.maxDeliveries()).isEqualTo(3);
+        assertThat(p.withMaxDeliveries(1).maxDeliveries()).isEqualTo(1);
     }
 
     @Test

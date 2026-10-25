@@ -6,6 +6,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
+import java.util.stream.IntStream;
 
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -14,16 +15,22 @@ import org.mockito.ArgumentCaptor;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.anyCollection;
+import static org.mockito.ArgumentMatchers.anyInt;
 import static org.mockito.ArgumentMatchers.anyList;
+import static org.mockito.ArgumentMatchers.contains;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
+import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 
 import app.vaultdoc.catalog.domain.Tag;
 import app.vaultdoc.catalog.event.DocumentTagsChangedEvent;
+import app.vaultdoc.catalog.service.TagIndexResyncQueue;
 import app.vaultdoc.catalog.service.TagService;
 import app.vaultdoc.ingest.event.DocumentFinalizedEvent;
 import app.vaultdoc.search.domain.DocumentTagsUpdate;
@@ -33,6 +40,7 @@ class TagIndexSynchronizerTest {
 
     private TagService tags;
     private SearchService search;
+    private TagIndexResyncQueue queue;
     private TagIndexSynchronizer sync;
 
     private final UUID userId = UUID.randomUUID();
@@ -43,7 +51,8 @@ class TagIndexSynchronizerTest {
     void setUp() {
         tags = mock(TagService.class);
         search = mock(SearchService.class);
-        sync = new TagIndexSynchronizer(tags, search);
+        queue = mock(TagIndexResyncQueue.class);
+        sync = new TagIndexSynchronizer(tags, search, queue);
     }
 
     @Test
@@ -120,6 +129,137 @@ class TagIndexSynchronizerTest {
         sync.onDocumentFinalized(new DocumentFinalizedEvent(ready, userId, "application/pdf", "k", Instant.now()));
 
         verify(search, never()).updateTags(any(), anyList());
+    }
+
+    // ── chunking ────────────────────────────────────────────────────────────
+
+    @Test
+    void onTagsChanged_largeEventIsProcessedInChunks() {
+        List<UUID> ids = IntStream.range(0, 2_500).mapToObj(i -> UUID.randomUUID()).toList();
+        when(tags.tagsForIndexing(eq(userId), any())).thenAnswer(inv -> {
+            Map<UUID, List<Tag>> current = new LinkedHashMap<>();
+            for (Object id : (java.util.Collection<?>) inv.getArgument(1)) current.put((UUID) id, List.of());
+            return current;
+        });
+
+        sync.onTagsChanged(new DocumentTagsChangedEvent(userId, Set.copyOf(ids)));
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<java.util.Collection<UUID>> asked = ArgumentCaptor.forClass(java.util.Collection.class);
+        verify(tags, times(3)).tagsForIndexing(eq(userId), asked.capture());
+        assertThat(asked.getAllValues()).allSatisfy(chunk -> assertThat(chunk).hasSizeLessThanOrEqualTo(1_000));
+        assertThat(asked.getAllValues().stream().flatMap(java.util.Collection::stream)).containsExactlyInAnyOrderElementsOf(ids);
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<List<DocumentTagsUpdate>> sent = ArgumentCaptor.forClass(List.class);
+        verify(search, times(3)).updateTags(eq(userId), sent.capture());
+        assertThat(sent.getAllValues()).allSatisfy(batch -> assertThat(batch).hasSizeLessThanOrEqualTo(1_000));
+    }
+
+    @Test
+    void onTagsChanged_failingChunkIsQueuedAndOthersStillSync() {
+        List<UUID> ids = IntStream.range(0, 1_500).mapToObj(i -> UUID.randomUUID()).toList();
+        when(tags.tagsForIndexing(eq(userId), any())).thenAnswer(inv -> {
+            Map<UUID, List<Tag>> current = new LinkedHashMap<>();
+            for (Object id : (java.util.Collection<?>) inv.getArgument(1)) current.put((UUID) id, List.of());
+            return current;
+        });
+        doThrow(new IllegalStateException("ES rejected bulk")).doNothing().when(search).updateTags(any(), anyList());
+
+        sync.onTagsChanged(new DocumentTagsChangedEvent(userId, Set.copyOf(ids)));
+
+        verify(search, times(2)).updateTags(eq(userId), anyList());
+        verify(queue).enqueue(eq(userId), anyCollection(), contains("ES rejected bulk"));
+    }
+
+    // ── durable retry ───────────────────────────────────────────────────────
+
+    @Test
+    void onTagsChanged_searchFailure_isQueuedForRetry() {
+        when(tags.tagsForIndexing(eq(userId), any())).thenReturn(Map.of(ready, List.of()));
+        doThrow(new IllegalStateException("ES down")).when(search).updateTags(any(), anyList());
+
+        sync.onTagsChanged(new DocumentTagsChangedEvent(userId, Set.of(ready)));
+
+        verify(queue).enqueue(eq(userId), eq(Set.of(ready)), contains("ES down"));
+    }
+
+    @Test
+    void onTagsChanged_catalogFailure_isQueuedForRetry() {
+        when(tags.tagsForIndexing(eq(userId), any())).thenThrow(new IllegalStateException("db blip"));
+
+        sync.onTagsChanged(new DocumentTagsChangedEvent(userId, Set.of(ready)));
+
+        verify(queue).enqueue(eq(userId), eq(Set.of(ready)), contains("db blip"));
+    }
+
+    @Test
+    void onFinalized_searchFailure_isQueuedForRetry() {
+        Tag a = new Tag(UUID.randomUUID(), userId, "Alpha", null);
+        when(tags.tagsForIndexing(userId, Set.of(ready))).thenReturn(Map.of(ready, List.of(a)));
+        doThrow(new IllegalStateException("ES down")).when(search).updateTags(any(), anyList());
+
+        sync.onDocumentFinalized(new DocumentFinalizedEvent(ready, userId, "application/pdf", "k", Instant.now()));
+
+        verify(queue).enqueue(eq(userId), eq(Set.of(ready)), contains("ES down"));
+    }
+
+    @Test
+    void enqueueFailure_isSwallowed() {
+        when(tags.tagsForIndexing(eq(userId), any())).thenThrow(new IllegalStateException("db down"));
+        doThrow(new IllegalStateException("db still down")).when(queue).enqueue(any(), anyCollection(), any());
+
+        assertThatCode(() -> sync.onTagsChanged(new DocumentTagsChangedEvent(userId, Set.of(ready))))
+                .doesNotThrowAnyException();
+    }
+
+    @Test
+    void successfulSync_queuesNothing() {
+        when(tags.tagsForIndexing(eq(userId), any())).thenReturn(Map.of(ready, List.of()));
+
+        sync.onTagsChanged(new DocumentTagsChangedEvent(userId, Set.of(ready)));
+
+        verifyNoInteractions(queue);
+    }
+
+    @Test
+    void retryPending_resyncsDueDocumentsAndCompletesThem() {
+        UUID otherUser = UUID.randomUUID();
+        UUID otherDoc = UUID.randomUUID();
+        Tag a = new Tag(UUID.randomUUID(), userId, "NewName", null);
+        var mine = new TagIndexResyncQueue.Item(ready, userId, 1, 2);
+        var theirs = new TagIndexResyncQueue.Item(otherDoc, otherUser, 1, 0);
+        when(queue.due(anyInt())).thenReturn(List.of(mine, theirs));
+        when(tags.tagsForIndexing(userId, Set.of(ready))).thenReturn(Map.of(ready, List.of(a)));
+        when(tags.tagsForIndexing(otherUser, Set.of(otherDoc))).thenReturn(Map.of());
+
+        assertThat(sync.retryPending()).isEqualTo(2);
+
+        verify(search).updateTags(userId, List.of(new DocumentTagsUpdate(ready, List.of(a.getId()), List.of("NewName"))));
+        verify(search, never()).updateTags(eq(otherUser), anyList());
+        verify(queue).completed(List.of(mine));
+        verify(queue).completed(List.of(theirs));
+        verify(queue, never()).failed(anyCollection(), any());
+    }
+
+    @Test
+    void retryPending_failureRecordsAttemptAndKeepsItem() {
+        var item = new TagIndexResyncQueue.Item(ready, userId, 1, 0);
+        when(queue.due(anyInt())).thenReturn(List.of(item));
+        when(tags.tagsForIndexing(userId, Set.of(ready))).thenReturn(Map.of(ready, List.of()));
+        doThrow(new IllegalStateException("ES still down")).when(search).updateTags(any(), anyList());
+
+        assertThat(sync.retryPending()).isZero();
+
+        verify(queue).failed(eq(List.of(item)), contains("ES still down"));
+        verify(queue, never()).completed(anyCollection());
+        verify(queue, never()).enqueue(any(), anyCollection(), any());
+    }
+
+    @Test
+    void retryPending_queueUnavailable_isSwallowed() {
+        when(queue.due(anyInt())).thenThrow(new IllegalStateException("db down"));
+
+        assertThat(sync.retryPending()).isZero();
     }
 
     @SuppressWarnings("unchecked")

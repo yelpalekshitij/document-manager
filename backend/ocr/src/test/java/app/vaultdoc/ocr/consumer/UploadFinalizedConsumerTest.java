@@ -150,6 +150,31 @@ class UploadFinalizedConsumerTest {
         verify(streamOps).acknowledge(StreamNames.UPLOAD_FINALIZED, GROUP, RecordId.of("6-0"));
     }
 
+    @Test
+    void dead_letter_marks_failed_publishes_dlq_and_acks() {
+        consumer.deadLetter(record("9-0"), "OCR did not complete after 3 delivery attempts");
+
+        verify(documents).markOcr(documentId, OcrStatus.FAILED, null, null, "OCR did not complete after 3 delivery attempts");
+        verify(ocr, never()).extract(any(), any());
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<Map<String, String>> dlq = ArgumentCaptor.forClass(Map.class);
+        verify(publisher).publish(eq(StreamNames.UPLOAD_FINALIZED_DLQ), dlq.capture());
+        assertThat(dlq.getValue()).containsEntry("errorMessage", "OCR did not complete after 3 delivery attempts");
+        verify(streamOps).acknowledge(StreamNames.UPLOAD_FINALIZED, GROUP, RecordId.of("9-0"));
+    }
+
+    @Test
+    void dead_letter_of_malformed_entry_still_acks() {
+        MapRecord<String, String, String> junk = StreamRecords.newRecord()
+                .in(StreamNames.UPLOAD_FINALIZED).withId(RecordId.of("9-1")).ofMap(Map.of("noise", "x"));
+
+        consumer.deadLetter(junk, "redelivered too often");
+
+        verify(documents, never()).markOcr(any(), any(), any(), any(), any());
+        verify(publisher).publish(eq(StreamNames.UPLOAD_FINALIZED_DLQ), anyMap());
+        verify(streamOps).acknowledge(StreamNames.UPLOAD_FINALIZED, GROUP, RecordId.of("9-1"));
+    }
+
     private MapRecord<String, String, String> record(String id) {
         return StreamRecords.newRecord().in(StreamNames.UPLOAD_FINALIZED)
                 .withId(RecordId.of(id)).ofMap(event().toMap());

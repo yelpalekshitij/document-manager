@@ -1,6 +1,7 @@
 package app.vaultdoc.ocr.service;
 
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 
 import org.slf4j.Logger;
@@ -24,6 +25,14 @@ public class RoutingOcrService implements OcrService {
 
     static final String PDF = "application/pdf";
     static final Set<String> IMAGES = Set.of("image/png", "image/jpeg", "image/tiff", "image/webp");
+
+    /** Non-standard spellings browsers, scanners and old mail clients still send. */
+    static final Map<String, String> ALIASES = Map.of(
+            "image/jpg", "image/jpeg",
+            "image/pjpeg", "image/jpeg",
+            "image/x-png", "image/png",
+            "image/tif", "image/tiff",
+            "image/x-tiff", "image/tiff");
 
     private final OcrService pdf;
     private final OcrService image;
@@ -59,10 +68,16 @@ public class RoutingOcrService implements OcrService {
         } catch (RuntimeException e) {
             log.error("OCR engine {} crashed for key={}", engine.getClass().getSimpleName(), key.value(), e);
             return OcrResult.failed("Unexpected OCR error: " + OcrText.summarize(e));
+        } catch (OutOfMemoryError e) {
+            // The engine's allocation failed, not the JVM at large: the oversized
+            // buffer is already unreachable. Record it so the document doesn't sit
+            // in PROCESSING and the stream entry is acked instead of redelivered.
+            log.error("OCR engine {} ran out of memory for key={}", engine.getClass().getSimpleName(), key.value(), e);
+            return OcrResult.failed("The document needs more memory to OCR than the server allows");
         }
     }
 
-    /** Lower-cases, trims, drops parameters ({@code ; charset=…}) and maps the {@code image/jpg} alias. */
+    /** Lower-cases, trims, drops parameters ({@code ; charset=…}) and maps {@link #ALIASES}. */
     static String normalise(String mimeType) {
         if (mimeType == null) return null;
         String mime = mimeType;
@@ -70,6 +85,6 @@ public class RoutingOcrService implements OcrService {
         if (semicolon >= 0) mime = mime.substring(0, semicolon);
         mime = mime.strip().toLowerCase(Locale.ROOT);
         if (mime.isEmpty()) return null;
-        return "image/jpg".equals(mime) ? "image/jpeg" : mime;
+        return ALIASES.getOrDefault(mime, mime);
     }
 }

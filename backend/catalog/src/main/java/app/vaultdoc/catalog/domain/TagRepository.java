@@ -17,6 +17,18 @@ public interface TagRepository extends JpaRepository<Tag, UUID> {
 
     long countByUserId(UUID userId);
 
+    /**
+     * Transaction-scoped advisory lock per user (namespace {@code vaultdoc.tags}).
+     * Serialises tag creation per user so count-then-insert can't overshoot the
+     * per-user cap; other users and other tables are unaffected.
+     */
+    @Query(value = """
+            select count(*) from (
+                select pg_advisory_xact_lock(hashtext('vaultdoc.tags'), hashtext(cast(:userId as varchar)))
+            ) locked
+            """, nativeQuery = true)
+    long lockTagsOfUser(@Param("userId") UUID userId);
+
     /** Same {@code LOWER()} the unique index uses, so the pre-check and the index agree. */
     @Query("select t from Tag t where t.userId = :userId and lower(t.name) = lower(:name)")
     Optional<Tag> findByUserIdAndNameIgnoreCase(@Param("userId") UUID userId, @Param("name") String name);

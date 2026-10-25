@@ -59,6 +59,13 @@ import { TagsStore } from '../tags/tags.store';
 
         <vd-upload-zone />
 
+        @if (store.listError(); as err) {
+          <p class="list-error" role="alert">
+            {{ err }}
+            <button type="button" class="link retry" (click)="store.loadDocuments()">Retry</button>
+          </p>
+        }
+
         @if (store.searching()) {
           <section class="results">
             <h3>Search results</h3>
@@ -145,6 +152,7 @@ import { TagsStore } from '../tags/tags.store';
       .filename { font-weight: 500; }
       .uploaded { color: var(--vd-fg-muted); font-size: 0.8rem; }
       .muted { color: var(--vd-fg-muted); }
+      .list-error { margin: 0; color: var(--vd-danger); font-size: 0.85rem; }
     `,
   ],
 })

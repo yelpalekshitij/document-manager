@@ -129,6 +129,28 @@ class CliTesseractRunnerTest {
     }
 
     @Test
+    void list_langs_passes_tessdata_dir() throws IOException {
+        Path argsFile = dir.resolve("list-args.txt");
+        Path bin = script("for a in \"$@\"; do echo \"$a\" >> '" + argsFile + "'; done; echo 'List of available languages (1):'; echo eng");
+        Path tessdata = Files.createDirectories(dir.resolve("custom tessdata"));
+        var runner = new CliTesseractRunner(bin.toString(), tessdata, Duration.ofSeconds(10), work);
+
+        assertThat(runner.listLanguages()).containsExactly("eng");
+        assertThat(Files.readAllLines(argsFile)).containsExactly("--list-langs", "--tessdata-dir", tessdata.toString());
+    }
+
+    @Test
+    void list_langs_falls_back_to_stderr_for_tesseract4() throws IOException {
+        Path bin = script("""
+                echo 'List of available languages (2):' >&2
+                echo 'eng' >&2
+                echo 'hin' >&2""");
+        var runner = new CliTesseractRunner(bin.toString(), null, Duration.ofSeconds(10), work);
+
+        assertThat(runner.listLanguages()).containsExactlyInAnyOrder("eng", "hin");
+    }
+
+    @Test
     void removes_its_scratch_files() throws IOException {
         var ok = new CliTesseractRunner(script("echo fine").toString(), null, Duration.ofSeconds(10), work);
         var bad = new CliTesseractRunner(script("exit 3").toString(), null, Duration.ofSeconds(10), work);

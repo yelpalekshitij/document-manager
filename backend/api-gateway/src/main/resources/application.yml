@@ -105,6 +105,13 @@ vaultdoc:
     pdf-ocr-dpi: ${OCR_PDF_DPI:300}
     pdf-min-text-chars-per-page: ${OCR_PDF_MIN_TEXT_CHARS:25}
     temp-dir: ${OCR_TEMP_DIR:}
+    max-image-frames: ${OCR_MAX_IMAGE_FRAMES:20}              # multi-page TIFF: frames OCR'd one by one
+    pdf-max-pages: ${OCR_PDF_MAX_PAGES_TOTAL:2000}            # PDF pages read at all; the rest is noted, not indexed
+    document-ocr-budget: ${OCR_DOCUMENT_BUDGET:10m}           # all tesseract work on one document
+    # Unacked stream entries idle this long belong to a dead worker and are reclaimed.
+    reclaim-min-idle: ${OCR_RECLAIM_MIN_IDLE:30m}             # keep above document-ocr-budget
+    reclaim-interval: ${OCR_RECLAIM_INTERVAL:1m}
+    max-deliveries: ${OCR_MAX_DELIVERIES:3}                   # then dead-lettered as FAILED
   web:
     cors:
       allowed-origins: ${CORS_ALLOWED_ORIGINS:http://localhost:4200,http://10.0.2.2:4200}

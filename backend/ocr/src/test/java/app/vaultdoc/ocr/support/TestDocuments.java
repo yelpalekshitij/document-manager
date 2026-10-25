@@ -5,6 +5,7 @@ import java.awt.Font;
 import java.awt.Graphics2D;
 import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.util.List;
@@ -14,6 +15,7 @@ import javax.imageio.ImageIO;
 import javax.imageio.ImageWriter;
 import javax.imageio.stream.ImageOutputStream;
 
+import org.apache.pdfbox.cos.COSName;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.PDPage;
 import org.apache.pdfbox.pdmodel.PDPageContentStream;
@@ -22,6 +24,7 @@ import org.apache.pdfbox.pdmodel.encryption.AccessPermission;
 import org.apache.pdfbox.pdmodel.encryption.StandardProtectionPolicy;
 import org.apache.pdfbox.pdmodel.font.PDType1Font;
 import org.apache.pdfbox.pdmodel.font.Standard14Fonts;
+import org.apache.pdfbox.pdmodel.graphics.color.PDDeviceGray;
 import org.apache.pdfbox.pdmodel.graphics.image.LosslessFactory;
 import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 
@@ -32,6 +35,9 @@ import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 public final class TestDocuments {
 
     private TestDocuments() {}
+
+    /** Marker for {@link #pdf(List)}: a page with no content stream at all (e.g. a blank separator page). */
+    public static final Object BLANK_PAGE = new Object();
 
     /** Black text on white, large font so real tesseract reads it reliably. */
     public static BufferedImage textImage(String text, int width, int height) {
@@ -56,6 +62,32 @@ public final class TestDocuments {
 
     public static byte[] jpeg(BufferedImage image) {
         return encode(image, "jpeg");
+    }
+
+    /**
+     * JPEG with an EXIF APP1 segment carrying only the Orientation tag (0x0112),
+     * as phone cameras write it: pixels stored as shot, rotation in metadata.
+     */
+    public static byte[] jpegWithExifOrientation(BufferedImage image, int orientation) {
+        byte[] jpeg = jpeg(image);
+        // TIFF header (little-endian) + IFD0 with one SHORT entry + next-IFD 0.
+        byte[] tiff = {
+                'I', 'I', 42, 0, 8, 0, 0, 0,
+                1, 0,
+                0x12, 0x01, 3, 0, 1, 0, 0, 0, (byte) orientation, 0, 0, 0,
+                0, 0, 0, 0};
+        byte[] exifId = {'E', 'x', 'i', 'f', 0, 0};
+        int length = 2 + exifId.length + tiff.length;
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(jpeg, 0, 2);                                   // SOI
+        out.write(0xFF);
+        out.write(0xE1);                                         // APP1
+        out.write(length >> 8);
+        out.write(length & 0xFF);
+        out.write(exifId, 0, exifId.length);
+        out.write(tiff, 0, tiff.length);
+        out.write(jpeg, 2, jpeg.length - 2);
+        return out.toByteArray();
     }
 
     public static byte[] tiff(BufferedImage image) {
@@ -134,12 +166,16 @@ public final class TestDocuments {
         return b;
     }
 
-    /** One page per entry: a string draws as real PDF text, a BufferedImage as an image-only page. */
+    /**
+     * One page per entry: a string draws as real PDF text, a BufferedImage as an
+     * image-only page, {@link #BLANK_PAGE} as a page without any content stream.
+     */
     public static byte[] pdf(List<?> pages) {
         try (PDDocument doc = new PDDocument()) {
             for (Object content : pages) {
                 PDPage page = new PDPage(PDRectangle.LETTER);
                 doc.addPage(page);
+                if (content == BLANK_PAGE) continue;
                 try (PDPageContentStream stream = new PDPageContentStream(doc, page)) {
                     if (content instanceof String text) {
                         stream.beginText();
@@ -163,6 +199,26 @@ public final class TestDocuments {
     public static byte[] blankPdf(float widthPt, float heightPt) {
         try (PDDocument doc = new PDDocument()) {
             doc.addPage(new PDPage(new PDRectangle(widthPt, heightPt)));
+            return save(doc);
+        } catch (IOException e) {
+            throw new IllegalStateException(e);
+        }
+    }
+
+    /**
+     * A Letter page whose only content is an image XObject that <em>declares</em>
+     * {@code width × height} samples but carries a few bytes of data — the
+     * "small page, gigantic embedded image" decompression-bomb shape.
+     */
+    public static byte[] pdfWithDeclaredImage(int width, int height) {
+        try (PDDocument doc = new PDDocument()) {
+            PDPage page = new PDPage(PDRectangle.LETTER);
+            doc.addPage(page);
+            PDImageXObject image = new PDImageXObject(doc, new ByteArrayInputStream(new byte[] {0, 0, 0, 0}),
+                    COSName.FLATE_DECODE, width, height, 8, PDDeviceGray.INSTANCE);
+            try (PDPageContentStream stream = new PDPageContentStream(doc, page)) {
+                stream.drawImage(image, 50, 50, 100, 100);
+            }
             return save(doc);
         } catch (IOException e) {
             throw new IllegalStateException(e);

@@ -1,13 +1,12 @@
 package app.vaultdoc.ocr.service;
 
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.List;
 
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
 import org.apache.pdfbox.pdmodel.encryption.InvalidPasswordException;
-import org.apache.pdfbox.rendering.PDFRenderer;
-import org.apache.pdfbox.text.PDFTextStripper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -19,14 +18,22 @@ import app.vaultdoc.core.storage.StorageKey;
  * configured (Phase 1.4), each page whose text layer is (near-)empty is
  * rendered and OCR'd with Tesseract — so scanned PDFs and hybrid PDFs
  * (digital pages + scanned annexures) become searchable too.
+ *
+ * <p>A page that can't be OCR'd costs only that page: the document is
+ * {@code DONE} with the text that was extracted and a note naming what is
+ * missing. It is {@code FAILED} only when no page produced any text.
  */
 public class PdfBoxOcrService implements OcrService {
 
     private static final Logger log = LoggerFactory.getLogger(PdfBoxOcrService.class);
 
+    /** Text-layer pages extracted per document when no explicit cap is configured. */
+    public static final int DEFAULT_MAX_TEXT_PAGES = 2_000;
+
     private final ObjectStorage storage;
     private final int extractedTextLimitBytes;
     private final ScannedPdfFallback fallback;
+    private final int maxTextPages;
 
     /** PDFBox only — image-only pages yield empty text (Phase 1.3 behaviour). */
     public PdfBoxOcrService(ObjectStorage storage, int extractedTextLimitBytes) {
@@ -35,9 +42,15 @@ public class PdfBoxOcrService implements OcrService {
 
     /** @param fallback scanned-page OCR; null disables it */
     public PdfBoxOcrService(ObjectStorage storage, int extractedTextLimitBytes, ScannedPdfFallback fallback) {
+        this(storage, extractedTextLimitBytes, fallback, DEFAULT_MAX_TEXT_PAGES);
+    }
+
+    /** @param maxTextPages only the first this-many pages are read at all (text layer and OCR) */
+    public PdfBoxOcrService(ObjectStorage storage, int extractedTextLimitBytes, ScannedPdfFallback fallback, int maxTextPages) {
         this.storage = storage;
         this.extractedTextLimitBytes = extractedTextLimitBytes;
         this.fallback = fallback;
+        this.maxTextPages = maxTextPages > 0 ? maxTextPages : DEFAULT_MAX_TEXT_PAGES;
     }
 
     @Override
@@ -55,10 +68,17 @@ public class PdfBoxOcrService implements OcrService {
 
         try (PDDocument doc = Loader.loadPDF(bytes)) {
             int pageCount = doc.getNumberOfPages();
-            String text = fallback == null
-                    ? new PDFTextStripper().getText(doc)
-                    : extractPageByPage(doc, key);
-            return OcrResult.done(OcrText.capToLimit(text, extractedTextLimitBytes), pageCount);
+            List<String> notes = new ArrayList<>();
+            List<String> pages = PageTextExtractor.extract(doc, maxTextPages);
+            if (pages.size() < pageCount) {
+                notes.add("Only the first %d of %d pages were indexed; later pages are not searchable"
+                        .formatted(pages.size(), pageCount));
+            }
+            String text = fallback == null ? join(pages) : withScannedPages(doc, pages, notes, key);
+            if (!notes.isEmpty()) {
+                log.warn("PDF only partly searchable key={} : {}", key.value(), notes);
+            }
+            return OcrResult.done(OcrText.capToLimit(text, extractedTextLimitBytes), pageCount, String.join("; ", notes));
         } catch (ScannedPageFailure e) {
             log.warn("Scanned-PDF OCR failed key={} : {}", key.value(), e.getMessage());
             return OcrResult.failed(e.getMessage());
@@ -74,50 +94,43 @@ public class PdfBoxOcrService implements OcrService {
     }
 
     /**
-     * Text layer page by page; scanned pages (up to the fallback's page cap)
-     * are replaced by their OCR text when that yields more visible characters.
+     * Scanned pages (within the fallback's page cap and time budget) are
+     * replaced by their OCR text when that yields more visible characters.
+     * Per-page failures are collected, never thrown, unless nothing readable
+     * is left at all.
      */
-    private String extractPageByPage(PDDocument doc, StorageKey key) throws IOException, ScannedPageFailure {
-        PDFTextStripper stripper = new PDFTextStripper();
-        PDFRenderer renderer = null;
-        TempWorkspace workspace = null;
-        List<String> langs = null;
-        int ocrPages = 0;
-        int skippedOverCap = 0;
-        StringBuilder out = new StringBuilder();
-        try {
-            for (int page = 1; page <= doc.getNumberOfPages(); page++) {
-                stripper.setStartPage(page);
-                stripper.setEndPage(page);
-                String pageText = stripper.getText(doc).strip();
-
-                if (fallback.isScanned(pageText)) {
-                    if (ocrPages >= fallback.maxPages()) {
-                        skippedOverCap++;
-                    } else {
-                        try {
-                            if (langs == null) langs = fallback.languages();
-                            if (renderer == null) renderer = new PDFRenderer(doc);
-                            if (workspace == null) workspace = fallback.openWorkspace();
-                            String ocr = fallback.ocrPage(renderer, doc.getPage(page - 1), page - 1, langs, workspace);
-                            ocrPages++;
-                            if (OcrText.visibleChars(ocr) >= OcrText.visibleChars(pageText)) pageText = ocr;
-                        } catch (ScannedPdfFallback.PageOcrException e) {
-                            throw new ScannedPageFailure("Scanned-PDF OCR failed on page " + page + ": " + e.getMessage());
-                        }
-                    }
-                }
-                if (!pageText.isEmpty()) {
-                    if (!out.isEmpty()) out.append("\n\n");
-                    out.append(pageText);
+    private String withScannedPages(PDDocument doc, List<String> pages, List<String> notes, StorageKey key)
+            throws ScannedPageFailure {
+        List<String> out = new ArrayList<>(pages);
+        PageOcrTally tally;
+        try (ScannedPdfFallback.Session session = fallback.open(doc)) {
+            tally = session.tally();
+            for (int i = 0; i < out.size(); i++) {
+                String pageText = out.get(i);
+                if (!fallback.isScanned(pageText)) continue;
+                String ocr = session.ocrIfAllowed(i);
+                if (ocr != null && OcrText.visibleChars(ocr) >= OcrText.visibleChars(pageText)) {
+                    out.set(i, ocr);
                 }
             }
-        } finally {
-            if (workspace != null) workspace.close();
         }
-        if (skippedOverCap > 0) {
-            log.warn("Scanned-PDF OCR page cap reached key={} ocrPages={} notOcrd={}",
-                    key.value(), ocrPages, skippedOverCap);
+        String text = join(out);
+        if (text.isEmpty() && tally.anyFailed()) {
+            throw new ScannedPageFailure(tally.failureReason("Scanned-PDF OCR"));
+        }
+        if (tally.anyFailed()) {
+            log.warn("Scanned-PDF OCR failed on some pages key={} : {}", key.value(), tally.failureReason("OCR"));
+        }
+        notes.addAll(tally.notes("scanned pages"));
+        return text;
+    }
+
+    private static String join(List<String> pages) {
+        StringBuilder out = new StringBuilder();
+        for (String page : pages) {
+            if (page.isEmpty()) continue;
+            if (!out.isEmpty()) out.append("\n\n");
+            out.append(page);
         }
         return out.toString();
     }

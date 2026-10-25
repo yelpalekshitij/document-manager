@@ -1568,8 +1568,11 @@ components:
           description: |
             Human-readable reason when `ocrStatus` is FAILED (e.g. tesseract
             timeout, image over the pixel limit, no OCR language installed) or
-            SKIPPED (e.g. unsupported file type). Null otherwise. Safe to show
-            to the document owner.
+            SKIPPED (e.g. unsupported file type). On DONE it is a note saying
+            which part is *not* searchable (pages over the per-document cap,
+            the OCR time budget, a page that could not be OCR'd); null when
+            the whole document was extracted. Safe to show to the document
+            owner.
         tags:
           type: array
           description: The document's tags, sorted by name.

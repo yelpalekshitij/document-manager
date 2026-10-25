@@ -1,8 +1,9 @@
 import { TestBed } from '@angular/core/testing';
-import { of, throwError } from 'rxjs';
+import { Subject, of, throwError } from 'rxjs';
 
 import { DocumentsService, FoldersService, SearchService, TagsService } from '../../core/api/generated';
-import { DocumentsStore } from './documents.store';
+import { DocumentListResponse, SearchHit, SearchResponse } from '../../core/api/types';
+import { DocumentsStore, MAX_TAG_FILTER, mimeTypeFor } from './documents.store';
 import { TagsStore } from '../tags/tags.store';
 import {
   createDocumentsApiSpy,
@@ -170,6 +171,120 @@ describe('DocumentsStore (tags)', () => {
     expect(store.documents()[0].tags).toEqual([ref(tax)]);
   });
 
+  // ── Review fixes ─────────────────────────────────────────────────────────
+
+  it('toggleTag refuses a 21st tag and never sends more than 20 ids', () => {
+    for (let i = 0; i < MAX_TAG_FILTER; i++) store.toggleTag(`t${i}`);
+    docsApi.listDocuments.calls.reset();
+
+    store.toggleTag('t20');
+
+    expect(store.selectedTagIds().length).toBe(MAX_TAG_FILTER);
+    expect(store.selectedTagIds()).not.toContain('t20');
+    expect(docsApi.listDocuments).not.toHaveBeenCalled();
+    expect(store.tagError()).toContain('20');
+
+    // Deselecting still works at the cap.
+    store.toggleTag('t0');
+    expect(store.selectedTagIds().length).toBe(MAX_TAG_FILTER - 1);
+  });
+
+  it('list load failure under a tag filter sets an error instead of an unhandled rejection', async () => {
+    store.toggleTag(tax.id);
+    (docsApi.listDocuments as jasmine.Spy).and.returnValue(throwError(() => problem(400, 'invalid-tag')));
+
+    await expectAsync(store.loadDocuments()).toBeResolved();
+
+    expect(store.listError()).toBe('Could not load documents.');
+    expect(store.loading()).toBeFalse();
+
+    (docsApi.listDocuments as jasmine.Spy).and.returnValue(of({ items: [], page: 0, pageSize: 100, totalCount: 0 }));
+    await store.loadDocuments();
+    expect(store.listError()).toBeNull();
+  });
+
+  it('search failure sets an error instead of an unhandled rejection', async () => {
+    (searchApi.searchDocuments as jasmine.Spy).and.returnValue(throwError(() => new Error('offline')));
+
+    await expectAsync(store.runSearch('lease')).toBeResolved();
+
+    expect(store.listError()).toBe('Search failed. Please try again.');
+  });
+
+  it('stale list response from an earlier toggle does not overwrite the latest filter', async () => {
+    const forA = new Subject<DocumentListResponse>();
+    const forAB = new Subject<DocumentListResponse>();
+    (docsApi.listDocuments as jasmine.Spy).and.returnValues(forA, forAB);
+
+    store.toggleTag(tax.id);
+    store.toggleTag(paid.id);
+    forAB.next({ items: [makeDoc('both')], page: 0, pageSize: 100, totalCount: 1 });
+    forAB.complete();
+    await Promise.resolve();
+    forA.next({ items: [makeDoc('only-tax'), makeDoc('also-tax')], page: 0, pageSize: 100, totalCount: 2 });
+    forA.complete();
+    await new Promise((r) => setTimeout(r));
+
+    expect(store.documents().map((d) => d.id)).toEqual(['both']);
+    expect(store.totalCount()).toBe(1);
+    expect(store.loading()).toBeFalse();
+  });
+
+  it('stale search response does not overwrite the latest one', async () => {
+    const first = new Subject<SearchResponse>();
+    const second = new Subject<SearchResponse>();
+    (searchApi.searchDocuments as jasmine.Spy).and.returnValues(first, second);
+
+    const a = store.runSearch('pass');
+    const b = store.runSearch('passport');
+    second.next({ items: [{ documentId: 'new' } as SearchHit], totalCount: 1, page: 0, pageSize: 50 });
+    second.complete();
+    first.next({ items: [{ documentId: 'old' } as SearchHit], totalCount: 1, page: 0, pageSize: 50 });
+    first.complete();
+    await Promise.all([a, b]);
+
+    expect(store.searchHits().map((h) => h.documentId)).toEqual(['new']);
+  });
+
+  it('deleting an already-deleted tag (404) still prunes it from the filter and strips chips', async () => {
+    await tags.load();
+    store.toggleTag(tax.id);
+    store.toggleTag(paid.id);
+    await seedRows(makeDoc('d1', [ref(paid), ref(tax)]));
+    (tagsApi.deleteTag as jasmine.Spy).and.returnValue(throwError(() => problem(404, 'tag-not-found')));
+
+    expect(await store.deleteTag(tax.id)).toBeTrue();
+
+    expect(store.selectedTagIds()).toEqual([paid.id]);
+    expect(store.documents()[0].tags).toEqual([ref(paid)]);
+    expect(docsApi.listDocuments).toHaveBeenCalledWith(undefined, 0, 100, [paid.id]);
+  });
+
+  it('renaming a vanished tag (404) prunes it from the filter and strips chips', async () => {
+    await tags.load();
+    store.toggleTag(tax.id);
+    await seedRows(makeDoc('d1', [ref(tax), ref(paid)]));
+    (tagsApi.updateTag as jasmine.Spy).and.returnValue(throwError(() => problem(404, 'tag-not-found')));
+
+    expect(await store.updateTag(tax.id, { name: 'Taxes' })).toBeNull();
+
+    expect(store.selectedTagIds()).toEqual([]);
+    expect(store.documents()[0].tags).toEqual([ref(paid)]);
+    expect(docsApi.listDocuments).toHaveBeenCalledWith(undefined, 0, 100, undefined);
+  });
+
+  it('a non-404 rename failure keeps chips and filter', async () => {
+    await tags.load();
+    store.toggleTag(tax.id);
+    await seedRows(makeDoc('d1', [ref(tax)]));
+    (tagsApi.updateTag as jasmine.Spy).and.returnValue(throwError(() => new Error('offline')));
+
+    expect(await store.updateTag(tax.id, { name: 'Taxes' })).toBeNull();
+
+    expect(store.selectedTagIds()).toEqual([tax.id]);
+    expect(store.documents()[0].tags).toEqual([ref(tax)]);
+  });
+
   it('tag rename / recolor patches chips in place', async () => {
     await tags.load();
     await seedRows(makeDoc('d1', [ref(tax)]));
@@ -179,5 +294,31 @@ describe('DocumentsStore (tags)', () => {
     await store.updateTag(tax.id, { name: 'Taxes', color: '#e5534b' });
 
     expect(store.documents()[0].tags).toEqual([{ id: tax.id, name: 'Taxes', color: '#e5534b' }]);
+  });
+});
+
+describe('mimeTypeFor', () => {
+  const file = (name: string, type = '') => new File([new Uint8Array([1])], name, { type });
+
+  it('keeps the browser-reported type', () => {
+    expect(mimeTypeFor(file('scan.png', 'image/png'))).toBe('image/png');
+  });
+
+  it('infers the type from the extension when the browser reports none', () => {
+    expect(mimeTypeFor(file('Lease.PDF'))).toBe('application/pdf');
+    expect(mimeTypeFor(file('fax.tif'))).toBe('image/tiff');
+    expect(mimeTypeFor(file('fax.tiff'))).toBe('image/tiff');
+    expect(mimeTypeFor(file('photo.jpeg'))).toBe('image/jpeg');
+    expect(mimeTypeFor(file('photo.jpg'))).toBe('image/jpeg');
+    expect(mimeTypeFor(file('shot.webp'))).toBe('image/webp');
+    expect(mimeTypeFor(file('phone.heic'))).toBe('image/heic');
+    expect(mimeTypeFor(file('letter.docx'))).toBe(
+      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+    );
+  });
+
+  it('falls back to octet-stream for unknown or missing extensions', () => {
+    expect(mimeTypeFor(file('scan'))).toBe('application/octet-stream');
+    expect(mimeTypeFor(file('notes.xyz'))).toBe('application/octet-stream');
   });
 });

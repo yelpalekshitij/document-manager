@@ -4,6 +4,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -26,9 +27,11 @@ import app.vaultdoc.catalog.domain.OcrStatus;
 import app.vaultdoc.core.storage.ObjectStorage;
 import app.vaultdoc.core.storage.StorageKey;
 import app.vaultdoc.ocr.support.FakeTesseractRunner;
+import app.vaultdoc.ocr.support.MutableClock;
 import app.vaultdoc.ocr.support.TestDocuments;
 import app.vaultdoc.ocr.tesseract.TesseractLanguageResolver;
 import app.vaultdoc.ocr.tesseract.TesseractTimeoutException;
+import app.vaultdoc.ocr.tesseract.TesseractUnavailableException;
 
 class PdfBoxOcrServiceTest {
 
@@ -261,6 +264,149 @@ class PdfBoxOcrServiceTest {
         try (Stream<Path> left = Files.list(tempRoot)) {
             assertThat(left).isEmpty();
         }
+    }
+
+    // ── Review fixes: page-local failures, user-visible notes, hard limits ──
+
+    @Test
+    void text_pdf_with_blank_page_without_tesseract_keeps_text_layer() {
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of(
+                "Rental agreement between landlord and tenant", TestDocuments.BLANK_PAGE)));
+        var runner = FakeTesseractRunner.returning("never")
+                .withListFailure(new TesseractUnavailableException("tesseract not available at 'tesseract'", null));
+
+        OcrResult result = withFallback(runner).extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.DONE);
+        assertThat(result.text()).contains("Rental agreement");
+        assertThat(result.pageCount()).isEqualTo(2);
+        assertThat(result.failureReason()).contains("page 2").contains("tesseract not available");
+        assertThat(runner.calls()).isEmpty();
+    }
+
+    @Test
+    void hybrid_pdf_partial_page_failure_keeps_digital_text() {
+        var scan = TestDocuments.textImage("SCAN", 200, 80);
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of(
+                "Digital cover page with plenty of real text", scan, scan)));
+        AtomicInteger n = new AtomicInteger();
+        var runner = FakeTesseractRunner.answering((path, langs) -> {
+            if (n.incrementAndGet() == 2) throw new TesseractTimeoutException("tesseract timed out after 60s");
+            return "first scanned annexure";
+        });
+
+        OcrResult result = withFallback(runner).extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.DONE);
+        assertThat(result.text()).contains("Digital cover page").contains("first scanned annexure");
+        assertThat(result.failureReason()).contains("page 3").contains("timed out after 60s");
+        assertThat(runner.calls()).hasSize(2);
+    }
+
+    @Test
+    void tesseract_unavailable_is_probed_once_per_document() {
+        var scan = TestDocuments.textImage("SCAN", 200, 80);
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of(scan, scan, scan)));
+        var runner = FakeTesseractRunner.returning("never")
+                .withListFailure(new TesseractUnavailableException("tesseract not available at 'tesseract'", null));
+
+        OcrResult result = withFallback(runner).extract(key, "application/pdf");
+
+        // Nothing readable anywhere → FAILED, naming every page that could not be OCR'd.
+        assertThat(result.status()).isEqualTo(OcrStatus.FAILED);
+        assertThat(result.failureReason()).contains("pages 1, 2, 3").contains("tesseract not available");
+        assertThat(runner.listCalls()).isEqualTo(1);
+    }
+
+    @Test
+    void unusable_temp_root_is_failed_with_staging_reason() throws IOException {
+        Path notADirectory = Files.writeString(tempRoot.resolve("file"), "x");
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of(TestDocuments.textImage("SCAN", 200, 80))));
+        var runner = FakeTesseractRunner.returning("never");
+        var languages = new TesseractLanguageResolver(runner, List.of("eng"), msg -> {});
+        var fallback = new ScannedPdfFallback(runner, languages, 20, 300, 50_000_000, 25, notADirectory);
+
+        OcrResult result = new PdfBoxOcrService(storage, 2_000_000, fallback).extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.FAILED);
+        assertThat(result.failureReason()).containsIgnoringCase("temp").doesNotContain("could not parse");
+        assertThat(runner.calls()).isEmpty();
+    }
+
+    @Test
+    void page_cap_is_reported_to_the_user() {
+        var page = TestDocuments.textImage("SCAN", 200, 80);
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of(page, page, page)));
+        var runner = FakeTesseractRunner.returning("scanned words");
+
+        OcrResult result = fallbackService(runner, 2, 300, 50_000_000).extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.DONE);
+        assertThat(result.failureReason()).contains("first 2 of 3 scanned pages");
+    }
+
+    @Test
+    void time_budget_stops_ocr_of_later_pages_with_note() {
+        var page = TestDocuments.textImage("SCAN", 200, 80);
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of(page, page, page)));
+        var clock = new MutableClock();
+        AtomicInteger n = new AtomicInteger();
+        var runner = FakeTesseractRunner.answering((path, langs) -> {
+            clock.advance(Duration.ofMinutes(6));
+            return "scanned page " + n.incrementAndGet();
+        });
+        var languages = new TesseractLanguageResolver(runner, List.of("eng"), msg -> {});
+        var fallback = new ScannedPdfFallback(runner, languages, 20, 300, 50_000_000, 25, tempRoot,
+                Duration.ofMinutes(10), clock);
+
+        OcrResult result = new PdfBoxOcrService(storage, 2_000_000, fallback).extract(key, "application/pdf");
+
+        assertThat(runner.calls()).hasSize(2);
+        assertThat(result.status()).isEqualTo(OcrStatus.DONE);
+        assertThat(result.text()).contains("scanned page 1").contains("scanned page 2");
+        assertThat(result.failureReason()).contains("time budget").contains("page 3");
+    }
+
+    @Test
+    void oversized_embedded_image_fails_page_before_rendering() {
+        // Letter page (fine at 300 DPI) whose image XObject declares 60000 × 60000 samples.
+        when(storage.download(key)).thenReturn(TestDocuments.pdfWithDeclaredImage(60_000, 60_000));
+        var runner = FakeTesseractRunner.returning("never");
+
+        OcrResult result = withFallback(runner).extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.FAILED);
+        assertThat(result.failureReason()).contains("page 1").contains("embedded image").contains("60000×60000");
+        assertThat(runner.calls()).isEmpty();
+    }
+
+    @Test
+    void text_layer_page_cap_is_reported() {
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of(
+                "First page of a very long digital statement",
+                "Second page of a very long digital statement",
+                "Third page of a very long digital statement")));
+        var runner = FakeTesseractRunner.returning("never");
+        var languages = new TesseractLanguageResolver(runner, List.of("eng"), msg -> {});
+        var fallback = new ScannedPdfFallback(runner, languages, 20, 300, 50_000_000, 25, tempRoot);
+
+        OcrResult result = new PdfBoxOcrService(storage, 2_000_000, fallback, 2).extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.DONE);
+        assertThat(result.pageCount()).isEqualTo(3);
+        assertThat(result.text()).contains("First page").contains("Second page").doesNotContain("Third page");
+        assertThat(result.failureReason()).contains("first 2 of 3 pages");
+    }
+
+    @Test
+    void text_layer_page_cap_applies_without_fallback_too() {
+        when(storage.download(key)).thenReturn(TestDocuments.pdf(List.of("one one one", "two two two")));
+
+        OcrResult result = new PdfBoxOcrService(storage, 2_000_000, null, 1).extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.DONE);
+        assertThat(result.text()).contains("one").doesNotContain("two");
+        assertThat(result.failureReason()).contains("first 1 of 2 pages");
     }
 
     private PdfBoxOcrService withFallback(FakeTesseractRunner runner) {

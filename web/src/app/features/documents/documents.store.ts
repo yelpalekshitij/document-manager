@@ -17,6 +17,34 @@ import {
 import { presignedPut, sha256Hex, UploadProgress, UploadResult } from '../../core/upload/uploader';
 import { TagsStore, tagErrorMessage } from '../tags/tags.store';
 
+/** Same cap the API enforces on `tagIds` (more is a 400); the filter UI stops here. */
+export const MAX_TAG_FILTER = 20;
+
+const MIME_BY_EXTENSION: Readonly<Record<string, string>> = {
+  pdf: 'application/pdf',
+  jpg: 'image/jpeg',
+  jpeg: 'image/jpeg',
+  png: 'image/png',
+  webp: 'image/webp',
+  heic: 'image/heic',
+  tif: 'image/tiff',
+  tiff: 'image/tiff',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+};
+
+/**
+ * The browser's `File.type`, or — when it reports none (common for .tif,
+ * .heic and extension-less files) — the type implied by the extension. The
+ * server only accepts allow-listed types, so `application/octet-stream` would
+ * be rejected outright.
+ */
+export function mimeTypeFor(file: File): string {
+  if (file.type) return file.type;
+  const dot = file.name.lastIndexOf('.');
+  const ext = dot >= 0 ? file.name.slice(dot + 1).toLowerCase() : '';
+  return MIME_BY_EXTENSION[ext] ?? 'application/octet-stream';
+}
+
 export interface UploadingFile {
   id: string;
   filename: string;
@@ -46,6 +74,13 @@ export class DocumentsStore {
   /** Tag filter (AND semantics), combined with the folder and the search query. */
   private readonly _selectedTagIds = signal<string[]>([]);
   private readonly _tagError = signal<string | null>(null);
+  private readonly _listError = signal<string | null>(null);
+  /**
+   * Request sequence numbers: only the newest list / search response is
+   * applied, so a slow response for an older filter can't overwrite a newer one.
+   */
+  private listSeq = 0;
+  private searchSeq = 0;
 
   readonly folders = this._folders.asReadonly();
   readonly documents = this._documents.asReadonly();
@@ -59,44 +94,63 @@ export class DocumentsStore {
   readonly selectedTagIds = this._selectedTagIds.asReadonly();
   /** Last tag-assignment / tag-edit failure, shown next to the chips. */
   readonly tagError = this._tagError.asReadonly();
+  /** Last list / search load failure (shown as an alert above the table). */
+  readonly listError = this._listError.asReadonly();
 
   async loadFolders(): Promise<void> {
     const resp = await firstValueFrom(this.foldersApi.listFolders());
     this._folders.set(resp.folders ?? []);
   }
 
+  /** Never rejects: a failure lands in {@link listError}. */
   async loadDocuments(): Promise<void> {
+    const seq = ++this.listSeq;
     this._loading.set(true);
     try {
       const folderId = this._selectedFolderId() ?? undefined;
       const resp = await firstValueFrom(
         this.documentsApi.listDocuments(folderId, 0, 100, this.tagFilter()),
       );
+      if (seq !== this.listSeq) return;   // a newer load superseded this one
       this._documents.set(resp.items ?? []);
       this._totalCount.set(resp.totalCount ?? 0);
+      this._listError.set(null);
+    } catch {
+      if (seq === this.listSeq) this._listError.set('Could not load documents.');
     } finally {
-      this._loading.set(false);
+      if (seq === this.listSeq) this._loading.set(false);
     }
   }
 
+  /** Never rejects: a failure lands in {@link listError}. */
   async runSearch(q: string): Promise<void> {
+    const seq = ++this.searchSeq;
     this._query.set(q);
     if (!q.trim()) {
       this._searchHits.set([]);
       return;
     }
-    const resp = await firstValueFrom(
-      this.searchApi.searchDocuments(q, this._selectedFolderId() ?? undefined, 0, 50, this.tagFilter()),
-    );
-    this._searchHits.set(resp.items ?? []);
+    try {
+      const resp = await firstValueFrom(
+        this.searchApi.searchDocuments(q, this._selectedFolderId() ?? undefined, 0, 50, this.tagFilter()),
+      );
+      if (seq !== this.searchSeq) return;
+      this._searchHits.set(resp.items ?? []);
+      this._listError.set(null);
+    } catch {
+      if (seq === this.searchSeq) this._listError.set('Search failed. Please try again.');
+    }
   }
 
   // ── Tag filter ───────────────────────────────────────────────────────────
 
   toggleTag(tagId: string): void {
-    this._selectedTagIds.update((ids) =>
-      ids.includes(tagId) ? ids.filter((id) => id !== tagId) : [...ids, tagId],
-    );
+    const ids = this._selectedTagIds();
+    if (!ids.includes(tagId) && ids.length >= MAX_TAG_FILTER) {
+      this._tagError.set(`You can filter by at most ${MAX_TAG_FILTER} tags at once.`);
+      return;
+    }
+    this._selectedTagIds.set(ids.includes(tagId) ? ids.filter((id) => id !== tagId) : [...ids, tagId]);
     this.refreshResults();
   }
 
@@ -129,19 +183,35 @@ export class DocumentsStore {
     if (updated) {
       const chip: TagRef = { id: updated.id, name: updated.name, color: updated.color };
       this.patchTags((tags) => tags.map((t) => (t.id === id ? chip : t)));
+    } else if (this.vanished(id)) {
+      // Deleted elsewhere (404): the tag store already dropped it; follow suit.
+      await this.forgetTag(id);
     }
     return updated;
   }
 
+  /**
+   * True when the tag is gone afterwards — deleted here, or already deleted
+   * elsewhere (404). Either way chips and the filter forget it.
+   */
   async deleteTag(id: string): Promise<boolean> {
     const ok = await this.tagsStore.remove(id);
-    if (!ok) return false;
+    if (!ok && !this.vanished(id)) return false;
+    await this.forgetTag(id);
+    return true;
+  }
+
+  /** The tag store drops a tag on `tag-not-found`; anything else leaves it listed. */
+  private vanished(id: string): boolean {
+    return !this.tagsStore.byId().has(id);
+  }
+
+  private async forgetTag(id: string): Promise<void> {
     this.patchTags((tags) => tags.filter((t) => t.id !== id));
     if (this._selectedTagIds().includes(id)) {
       this._selectedTagIds.update((ids) => ids.filter((x) => x !== id));
       await this.reloadResults();
     }
-    return true;
   }
 
   private async assign(documentId: string, call: Observable<DocumentTagsResponse>): Promise<TagRef[] | null> {
@@ -236,11 +306,12 @@ export class DocumentsStore {
       const buffer = await file.arrayBuffer();
       const sha = await sha256Hex(buffer);
       const folderId = this._selectedFolderId() ?? undefined;
+      const mimeType = mimeTypeFor(file);
 
       const initiate = await firstValueFrom(
         this.documentsApi.initiateUpload({
           filename: file.name,
-          mimeType: file.type || 'application/octet-stream',
+          mimeType,
           sizeBytes: file.size,
           sha256: sha,
           folderId,
@@ -249,8 +320,8 @@ export class DocumentsStore {
 
       this.patchUpload(tempId, { status: 'uploading', documentId: initiate.documentId });
 
-      const blob = new Blob([buffer], { type: file.type });
-      await this.putWithProgress(initiate.uploadUrl, blob, file.type || 'application/octet-stream', tempId);
+      const blob = new Blob([buffer], { type: mimeType });
+      await this.putWithProgress(initiate.uploadUrl, blob, mimeType, tempId);
 
       this.patchUpload(tempId, { status: 'finalizing', percent: 100 });
 

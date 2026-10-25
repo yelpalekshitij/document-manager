@@ -11,6 +11,7 @@ import java.util.stream.IntStream;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.mockito.ArgumentCaptor;
+import org.mockito.InOrder;
 import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.dao.DataIntegrityViolationException;
 
@@ -19,6 +20,7 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyCollection;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.inOrder;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -108,6 +110,25 @@ class TagServiceImplTest {
         assertThatThrownBy(() -> service.create(userId, "one-too-many", null))
                 .isInstanceOf(TagLimitExceededException.class)
                 .hasMessageContaining("500");
+    }
+
+    @Test
+    void create_atLimitMinusOne_allowed() {
+        when(tags.countByUserId(userId)).thenReturn((long) TagService.MAX_TAGS_PER_USER - 1);
+
+        assertThat(service.create(userId, "the-500th", null).getName()).isEqualTo("the-500th");
+        verify(tags).saveAndFlush(any(Tag.class));
+    }
+
+    @Test
+    void create_serialisesPerUserBeforeCounting() {
+        // Two parallel creates at 499 must not both pass the count check.
+        service.create(userId, "x", null);
+
+        InOrder order = inOrder(tags);
+        order.verify(tags).lockTagsOfUser(userId);
+        order.verify(tags).countByUserId(userId);
+        order.verify(tags).saveAndFlush(any(Tag.class));
     }
 
     // ── update ──────────────────────────────────────────────────────────────
@@ -433,6 +454,102 @@ class TagServiceImplTest {
     }
 
     @Test
+    void addDocumentTag_atDocumentCap_rejected() {
+        givenDocument(docId);
+        Tag t = tag("fifty-first");
+        when(tags.findByIdAndUserId(t.getId(), userId)).thenReturn(Optional.of(t));
+        when(documentTags.findTagIdsByDocumentId(docId)).thenReturn(randomIds(TagService.MAX_TAGS_PER_DOCUMENT));
+
+        assertThatThrownBy(() -> service.addDocumentTag(userId, docId, t.getId()))
+                .isInstanceOf(InvalidTagException.class)
+                .hasMessageContaining("50");
+        verify(documentTags, never()).attach(any(), any());
+        verifyNoEvent();
+    }
+
+    @Test
+    void addDocumentTag_alreadyAttachedAtCap_isNoop() {
+        givenDocument(docId);
+        Tag t = tag("present");
+        when(tags.findByIdAndUserId(t.getId(), userId)).thenReturn(Optional.of(t));
+        List<UUID> attached = new ArrayList<>(randomIds(TagService.MAX_TAGS_PER_DOCUMENT - 1));
+        attached.add(t.getId());
+        when(documentTags.findTagIdsByDocumentId(docId)).thenReturn(attached);
+        givenDocumentTagRows(docId, t);
+
+        assertThat(service.addDocumentTag(userId, docId, t.getId())).containsExactly(t);
+        verifyNoEvent();
+    }
+
+    @Test
+    void addDocumentTag_belowCap_attaches() {
+        givenDocument(docId);
+        Tag t = tag("the-50th");
+        when(tags.findByIdAndUserId(t.getId(), userId)).thenReturn(Optional.of(t));
+        when(documentTags.findTagIdsByDocumentId(docId)).thenReturn(randomIds(TagService.MAX_TAGS_PER_DOCUMENT - 1));
+        when(documentTags.attach(docId, t.getId())).thenReturn(1);
+        givenDocumentTagRows(docId, t);
+
+        service.addDocumentTag(userId, docId, t.getId());
+
+        verify(documentTags).attach(docId, t.getId());
+        assertThat(capturedEvent().documentIds()).containsExactly(docId);
+    }
+
+    @Test
+    void addDocumentTag_locksDocumentBeforeCounting() {
+        givenDocument(docId);
+        Tag t = tag("tax");
+        when(tags.findByIdAndUserId(t.getId(), userId)).thenReturn(Optional.of(t));
+
+        service.addDocumentTag(userId, docId, t.getId());
+
+        InOrder order = inOrder(documents, documentTags);
+        order.verify(documents).lockForTagging(docId);
+        order.verify(documentTags).findTagIdsByDocumentId(docId);
+        order.verify(documentTags).attach(docId, t.getId());
+    }
+
+    @Test
+    void addDocumentTag_tagDeletedConcurrently_translatedToNotFound() {
+        givenDocument(docId);
+        Tag t = tag("doomed");
+        when(tags.findByIdAndUserId(t.getId(), userId)).thenReturn(Optional.of(t));
+        when(documentTags.attach(docId, t.getId()))
+                .thenThrow(new DataIntegrityViolationException("violates foreign key constraint document_tags_tag_id_fkey"));
+
+        assertThatThrownBy(() -> service.addDocumentTag(userId, docId, t.getId()))
+                .isInstanceOf(TagNotFoundException.class);
+        verifyNoEvent();
+    }
+
+    @Test
+    void setDocumentTags_tagDeletedConcurrently_translatedToNotFound() {
+        givenDocument(docId);
+        Tag t = tag("doomed");
+        when(tags.findAllByUserIdAndIdIn(eq(userId), anyCollection())).thenReturn(List.of(t));
+        when(documentTags.attach(docId, t.getId()))
+                .thenThrow(new DataIntegrityViolationException("violates foreign key constraint document_tags_tag_id_fkey"));
+
+        assertThatThrownBy(() -> service.setDocumentTags(userId, docId, List.of(t.getId())))
+                .isInstanceOf(TagNotFoundException.class);
+        verifyNoEvent();
+    }
+
+    @Test
+    void setDocumentTags_locksDocumentBeforeReadingCurrentTags() {
+        givenDocument(docId);
+        Tag t = tag("tax");
+        when(tags.findAllByUserIdAndIdIn(eq(userId), anyCollection())).thenReturn(List.of(t));
+
+        service.setDocumentTags(userId, docId, List.of(t.getId()));
+
+        InOrder order = inOrder(documents, documentTags);
+        order.verify(documents).lockForTagging(docId);
+        order.verify(documentTags).findTagIdsByDocumentId(docId);
+    }
+
+    @Test
     void removeDocumentTag_detaches_publishesEvent() {
         givenDocument(docId);
         Tag t = tag("tax");
@@ -555,6 +672,12 @@ class TagServiceImplTest {
         List<Object[]> list = new ArrayList<>();
         for (Tag t : rows) list.add(new Object[] {documentId, t});
         when(documentTags.findTagsForDocuments(eq(userId), anyCollection())).thenReturn(list);
+    }
+
+    private static List<UUID> randomIds(int n) {
+        List<UUID> ids = new ArrayList<>();
+        for (int i = 0; i < n; i++) ids.add(UUID.randomUUID());
+        return ids;
     }
 
     private DocumentTagsChangedEvent capturedEvent() {

@@ -30,6 +30,13 @@ import org.springframework.boot.context.properties.ConfigurationProperties;
  * @param pdfOcrDpi Render resolution for scanned PDF pages (72..600).
  * @param pdfMinTextCharsPerPage A PDF page with fewer non-whitespace characters than this is treated as scanned.
  * @param tempDir Parent directory for per-job scratch directories; null uses java.io.tmpdir.
+ * @param maxImageFrames At most this many frames of a multi-page TIFF are OCR'd (one tesseract call each).
+ * @param pdfMaxPages Only the first this-many PDF pages are read at all (text layer + OCR); the rest is reported, not indexed.
+ * @param documentOcrBudget Wall-clock budget for all tesseract work on one document; later pages are reported, not OCR'd.
+ * @param reclaimMinIdle An unacked stream entry idle this long is assumed orphaned (its worker died) and is reclaimed.
+ *                       Keep it above {@code documentOcrBudget} so live work is never claimed.
+ * @param reclaimInterval How often to sweep for orphaned entries.
+ * @param maxDeliveries An entry delivered this many times without completing is dead-lettered instead of retried.
  */
 @With
 @ConfigurationProperties(prefix = "vaultdoc.ocr")
@@ -49,7 +56,13 @@ public record OcrProperties(
         int pdfOcrMaxPages,
         int pdfOcrDpi,
         int pdfMinTextCharsPerPage,
-        String tempDir) {
+        String tempDir,
+        int maxImageFrames,
+        int pdfMaxPages,
+        Duration documentOcrBudget,
+        Duration reclaimMinIdle,
+        Duration reclaimInterval,
+        int maxDeliveries) {
 
     static final String DEFAULT_LANGUAGES = "eng+hin";
     static final Duration DEFAULT_TESSERACT_TIMEOUT = Duration.ofSeconds(60);
@@ -58,6 +71,12 @@ public record OcrProperties(
     static final int DEFAULT_PDF_OCR_MAX_PAGES = 20;
     static final int DEFAULT_PDF_OCR_DPI = 300;
     static final int DEFAULT_PDF_MIN_TEXT_CHARS_PER_PAGE = 25;
+    static final int DEFAULT_MAX_IMAGE_FRAMES = 20;
+    static final int DEFAULT_PDF_MAX_PAGES = 2_000;
+    static final Duration DEFAULT_DOCUMENT_OCR_BUDGET = Duration.ofMinutes(10);
+    static final Duration DEFAULT_RECLAIM_MIN_IDLE = Duration.ofMinutes(30);
+    static final Duration DEFAULT_RECLAIM_INTERVAL = Duration.ofMinutes(1);
+    static final int DEFAULT_MAX_DELIVERIES = 3;
 
     /**
      * Tesseract language codes ({@code eng}, {@code chi_sim}). Anything else is
@@ -86,11 +105,22 @@ public record OcrProperties(
         if (pdfOcrDpi < 72 || pdfOcrDpi > 600) pdfOcrDpi = DEFAULT_PDF_OCR_DPI;
         if (pdfMinTextCharsPerPage <= 0) pdfMinTextCharsPerPage = DEFAULT_PDF_MIN_TEXT_CHARS_PER_PAGE;
         if (tempDir != null && tempDir.isBlank()) tempDir = null;
+        if (maxImageFrames <= 0) maxImageFrames = DEFAULT_MAX_IMAGE_FRAMES;
+        if (pdfMaxPages <= 0) pdfMaxPages = DEFAULT_PDF_MAX_PAGES;
+        if (!positive(documentOcrBudget)) documentOcrBudget = DEFAULT_DOCUMENT_OCR_BUDGET;
+        if (!positive(reclaimMinIdle)) reclaimMinIdle = DEFAULT_RECLAIM_MIN_IDLE;
+        if (!positive(reclaimInterval)) reclaimInterval = DEFAULT_RECLAIM_INTERVAL;
+        if (maxDeliveries <= 0) maxDeliveries = DEFAULT_MAX_DELIVERIES;
+    }
+
+    private static boolean positive(Duration d) {
+        return d != null && !d.isZero() && !d.isNegative();
     }
 
     /** Every knob at its default — what an empty {@code vaultdoc.ocr} block binds to. */
     public static OcrProperties defaults() {
-        return new OcrProperties(null, null, 0, null, 0, null, null, null, null, 0, 0, null, 0, 0, 0, null);
+        return new OcrProperties(null, null, 0, null, 0, null, null, null, null, 0, 0, null, 0, 0, 0, null,
+                0, 0, null, null, null, 0);
     }
 
     /**

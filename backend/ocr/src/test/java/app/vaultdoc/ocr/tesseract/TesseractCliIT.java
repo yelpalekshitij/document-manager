@@ -1,5 +1,6 @@
 package app.vaultdoc.ocr.tesseract;
 
+import java.awt.image.BufferedImage;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
@@ -10,7 +11,6 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.junit.jupiter.api.Assumptions.assumeTrue;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
@@ -27,8 +27,9 @@ import app.vaultdoc.ocr.support.TestDocuments;
 
 /**
  * Runs the real tesseract binary. Skipped (not failed) when it isn't
- * installed — every behaviour that doesn't need the engine itself is covered
- * by the fake-runner unit tests.
+ * installed locally — every behaviour that doesn't need the engine itself is
+ * covered by the fake-runner unit tests — but <em>failed</em> when
+ * {@code CI_REQUIRE_TESSERACT=true}, which CI sets after installing it.
  */
 class TesseractCliIT {
 
@@ -41,7 +42,7 @@ class TesseractCliIT {
 
     @BeforeEach
     void requireTesseract() {
-        assumeTrue(TesseractBinary.available(), "tesseract binary not installed — skipping real-engine test");
+        TesseractBinary.assumeAvailableOrFailInCi();
         runner = new CliTesseractRunner(TesseractBinary.path().orElseThrow(), null, Duration.ofSeconds(60), tempRoot);
         // Default eng+hin: on a host with only eng this exercises graceful degradation.
         languages = new TesseractLanguageResolver(runner, OcrProperties.defaults().languageList());
@@ -57,6 +58,25 @@ class TesseractCliIT {
         assertThat(result.status()).as("reason: %s", result.failureReason()).isEqualTo(OcrStatus.DONE);
         assertThat(result.text()).contains("INVOICE").contains("4821");
         assertThat(languages.resolve()).contains("eng");
+    }
+
+    @Test
+    void reads_text_from_exif_rotated_phone_jpeg() {
+        // Stored the way a phone writes a portrait shot: raster turned 90° counter-clockwise,
+        // EXIF Orientation=6 ("rotate 90° clockwise to display"). Without honouring EXIF,
+        // tesseract 5 returns the words reversed/garbled.
+        BufferedImage upright = TestDocuments.textImage("INVOICE 4821", 1200, 200);
+        BufferedImage stored = new BufferedImage(200, 1200, BufferedImage.TYPE_INT_RGB);
+        for (int y = 0; y < 1200; y++) {
+            for (int x = 0; x < 200; x++) stored.setRGB(x, y, upright.getRGB(1199 - y, x));
+        }
+        when(storage.download(key)).thenReturn(TestDocuments.jpegWithExifOrientation(stored, 6));
+        var service = new ImageOcrService(storage, runner, languages, 25_000_000, 50_000_000, 2_000_000, tempRoot);
+
+        OcrResult result = service.extract(key, "image/jpeg");
+
+        assertThat(result.status()).as("reason: %s", result.failureReason()).isEqualTo(OcrStatus.DONE);
+        assertThat(result.text()).contains("INVOICE").contains("4821");
     }
 
     @Test

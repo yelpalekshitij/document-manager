@@ -114,6 +114,27 @@ describe('TagFilterComponent', () => {
     expect(docs.clearTagFilter).toHaveBeenCalled();
   });
 
+  it('unselected toggles are disabled once 20 tags are selected', async () => {
+    const many = Array.from({ length: 21 }, (_, i) => makeTag(`tag-${String(i).padStart(2, '0')}`));
+    (api.listTags as jasmine.Spy).and.returnValue(of({ tags: many }));
+    docs.selectedTagIds.set(many.slice(0, 20).map((t) => t.id));
+    await render();
+
+    const buttons = toggles();
+    const selected = buttons.filter((b) => b.getAttribute('aria-pressed') === 'true');
+    const unselected = buttons.filter((b) => b.getAttribute('aria-pressed') === 'false');
+    expect(selected.length).toBe(20);
+    expect(selected.every((b) => !b.disabled)).toBeTrue();   // can still deselect
+    expect(unselected.length).toBe(1);
+    expect(unselected[0].disabled).toBeTrue();
+    expect(el.querySelector('.limit')?.textContent).toContain('20');
+
+    docs.selectedTagIds.set(many.slice(0, 19).map((t) => t.id));
+    fixture.detectChanges();
+    expect(toggles().every((b) => !b.disabled)).toBeTrue();
+    expect(el.querySelector('.limit')).toBeNull();
+  });
+
   it('manage button emits manage', async () => {
     (api.listTags as jasmine.Spy).and.returnValue(of({ tags: [] }));
     await render();

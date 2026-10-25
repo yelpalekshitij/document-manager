@@ -67,6 +67,56 @@ describe('TagManagerComponent', () => {
     expect(closed).toBe(2);
   });
 
+  function focusables(): HTMLElement[] {
+    return Array.from(
+      el.querySelectorAll<HTMLElement>('[role="dialog"] button:not([disabled]), [role="dialog"] input, [role="dialog"] select'),
+    );
+  }
+
+  function tab(shift = false): KeyboardEvent {
+    const event = new KeyboardEvent('keydown', { key: 'Tab', shiftKey: shift, bubbles: true, cancelable: true });
+    (document.activeElement ?? el).dispatchEvent(event);
+    return event;
+  }
+
+  it('Tab from the last focusable element wraps to the first, and Shift+Tab reverses', () => {
+    document.body.appendChild(el);
+    const items = focusables();
+    const first = items[0];
+    const last = items[items.length - 1];
+
+    last.focus();
+    const forward = tab();
+    expect(forward.defaultPrevented).toBeTrue();
+    expect(document.activeElement).toBe(first);
+
+    first.focus();
+    const backward = tab(true);
+    expect(backward.defaultPrevented).toBeTrue();
+    expect(document.activeElement).toBe(last);
+
+    // In the middle, Tab is left to the browser.
+    items[1].focus();
+    expect(tab().defaultPrevented).toBeFalse();
+    el.remove();
+  });
+
+  it('closing returns focus to the element that opened it', () => {
+    fixture.destroy();
+    const trigger = document.createElement('button');
+    trigger.textContent = 'Manage';
+    document.body.appendChild(trigger);
+    trigger.focus();
+
+    const reopened = TestBed.createComponent(TagManagerComponent);
+    reopened.detectChanges();
+    (reopened.nativeElement as HTMLElement).querySelector<HTMLInputElement>('#new-tag-name')!.focus();
+    reopened.destroy();
+
+    expect(document.activeElement).toBe(trigger);
+    trigger.remove();
+  });
+
   it('create form is labelled and disabled when blank', async () => {
     const name = el.querySelector<HTMLInputElement>('#new-tag-name')!;
     expect(el.querySelector('label[for="new-tag-name"]')?.textContent).toContain('Name');

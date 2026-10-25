@@ -59,6 +59,8 @@ public class TagServiceImpl implements TagService {
     public Tag create(UUID userId, String name, String color) {
         String normalizedName = TagInput.normalizeName(name);
         String normalizedColor = TagInput.normalizeColor(color);
+        // Serialise creates per user: without it two creates at 499 both pass the count.
+        tags.lockTagsOfUser(userId);
         if (tags.countByUserId(userId) >= MAX_TAGS_PER_USER) {
             throw new TagLimitExceededException(MAX_TAGS_PER_USER);
         }
@@ -115,6 +117,7 @@ public class TagServiceImpl implements TagService {
     public List<Tag> setDocumentTags(UUID userId, UUID documentId, Collection<UUID> tagIds) {
         requireLiveDocument(userId, documentId);
         Set<UUID> desired = normalizeAssignment(tagIds);
+        documents.lockForTagging(documentId);
         List<Tag> resolved = desired.isEmpty() ? List.of() : tags.findAllByUserIdAndIdIn(userId, desired);
         if (resolved.size() != desired.size()) {
             Set<UUID> found = new HashSet<>();
@@ -133,7 +136,7 @@ public class TagServiceImpl implements TagService {
         }
         for (UUID wanted : desired) {
             if (!current.contains(wanted)) {
-                documentTags.attach(documentId, wanted);
+                attachOrNotFound(documentId, wanted);
                 changed = true;
             }
         }
@@ -147,7 +150,16 @@ public class TagServiceImpl implements TagService {
     public List<Tag> addDocumentTag(UUID userId, UUID documentId, UUID tagId) {
         requireLiveDocument(userId, documentId);
         requireTag(userId, tagId);
-        if (documentTags.attach(documentId, tagId) > 0) {
+        // Row lock first, so concurrent adds count one after another and the cap holds.
+        documents.lockForTagging(documentId);
+        List<UUID> current = documentTags.findTagIdsByDocumentId(documentId);
+        if (current.contains(tagId)) {
+            return tagsOf(userId, documentId);
+        }
+        if (current.size() >= MAX_TAGS_PER_DOCUMENT) {
+            throw new InvalidTagException("A document can carry at most " + MAX_TAGS_PER_DOCUMENT + " tags");
+        }
+        if (attachOrNotFound(documentId, tagId) > 0) {
             publish(userId, List.of(documentId));
         }
         return tagsOf(userId, documentId);
@@ -215,6 +227,20 @@ public class TagServiceImpl implements TagService {
             throw new InvalidTagException("A document can carry at most " + MAX_TAGS_PER_DOCUMENT + " tags");
         }
         return unique;
+    }
+
+    /**
+     * {@code ON CONFLICT DO NOTHING} covers a duplicate row, not the tag FK: a
+     * tag deleted between {@link #requireTag} and this insert surfaces as a
+     * constraint violation. To the caller that tag simply doesn't exist (any
+     * more) — 404, not 500.
+     */
+    private int attachOrNotFound(UUID documentId, UUID tagId) {
+        try {
+            return documentTags.attach(documentId, tagId);
+        } catch (DataIntegrityViolationException e) {
+            throw new TagNotFoundException(tagId);
+        }
     }
 
     /** The pre-check catches the common case; the unique index is the arbiter under concurrency. */

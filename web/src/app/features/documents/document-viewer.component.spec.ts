@@ -118,6 +118,35 @@ describe('DocumentViewerComponent — extracted-text panel', () => {
     expect(body(el).textContent).toContain('2 page(s)');
   });
 
+  it('DONE with a note shows the text and says what is not searchable', async () => {
+    const el = await render(() =>
+      Promise.resolve(
+        detail({
+          ocrStatus: 'DONE',
+          ocrText: 'Rental agreement',
+          ocrPageCount: 60,
+          ocrFailureReason: 'Only the first 20 of 60 scanned pages were OCR\'d (limit 20 per document); pages 21, … not searchable',
+        }),
+      ),
+    );
+    await settle();
+
+    expect(body(el).querySelector('pre')!.textContent).toBe('Rental agreement');
+    const note = body(el).querySelector('.ocr-note[role="status"]');
+    expect(note).not.toBeNull();
+    expect(note!.textContent).toContain('Partly searchable');
+    expect(note!.textContent).toContain('first 20 of 60 scanned pages');
+  });
+
+  it('DONE without a note shows no partial-search notice', async () => {
+    const el = await render(() =>
+      Promise.resolve(detail({ ocrStatus: 'DONE', ocrText: 'all good', ocrPageCount: 1, ocrFailureReason: null })),
+    );
+    await settle();
+
+    expect(body(el).querySelector('.ocr-note')).toBeNull();
+  });
+
   it('shows loading then in-progress copy', async () => {
     let resolve!: (d: DocumentDetail) => void;
     const el = await render(() => new Promise<DocumentDetail>((r) => (resolve = r)));

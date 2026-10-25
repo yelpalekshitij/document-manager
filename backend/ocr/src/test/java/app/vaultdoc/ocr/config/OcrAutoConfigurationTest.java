@@ -1,11 +1,13 @@
 package app.vaultdoc.ocr.config;
 
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.List;
 import java.util.UUID;
 
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.springframework.data.redis.core.StringRedisTemplate;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatCode;
@@ -15,6 +17,8 @@ import static org.mockito.Mockito.when;
 import app.vaultdoc.catalog.domain.OcrStatus;
 import app.vaultdoc.core.storage.ObjectStorage;
 import app.vaultdoc.core.storage.StorageKey;
+import app.vaultdoc.ocr.consumer.PendingEntryReclaimer;
+import app.vaultdoc.ocr.consumer.UploadFinalizedConsumer;
 import app.vaultdoc.ocr.service.OcrResult;
 import app.vaultdoc.ocr.service.OcrService;
 import app.vaultdoc.ocr.service.RoutingOcrService;
@@ -83,6 +87,25 @@ class OcrAutoConfigurationTest {
         config.ocrLifecycleLogger(props, resolver).onInit();
         resolver.resolve();
         assertThat(installed.listCalls()).isEqualTo(1);
+    }
+
+    @Test
+    void consumer_name_is_resolved_once_and_shared_with_the_reclaimer() {
+        OcrProperties props = OcrProperties.defaults().withReclaimMinIdle(Duration.ofMinutes(45)).withMaxDeliveries(5);
+        OcrAutoConfiguration.OcrConsumerName name = config.ocrConsumerName(props);
+
+        PendingEntryReclaimer reclaimer = config.pendingEntryReclaimer(
+                mock(StringRedisTemplate.class), mock(UploadFinalizedConsumer.class), props, name);
+        try {
+            assertThat(name.value()).startsWith("ocr-");
+            assertThat(name.value()).isEqualTo(name.value());
+            assertThat(reclaimer.consumerName()).isEqualTo(name.value());
+            assertThat(reclaimer.minIdle()).isEqualTo(Duration.ofMinutes(45));
+            assertThat(reclaimer.maxDeliveries()).isEqualTo(5);
+        } finally {
+            reclaimer.stop();
+        }
+        assertThat(config.ocrConsumerName(props.withConsumerName("ocr-fixed")).value()).isEqualTo("ocr-fixed");
     }
 
     @Test

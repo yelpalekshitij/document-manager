@@ -77,6 +77,7 @@ class TesseractLanguageResolverTest {
 
         assertThat(resolver.resolve()).isEmpty();
         assertThat(resolver.configured()).containsExactly("ENG");
+        assertThat(warnings()).singleElement().satisfies(msg -> assertThat(msg).contains("ENG").contains("NO languages"));
     }
 
     private List<String> warnings() {

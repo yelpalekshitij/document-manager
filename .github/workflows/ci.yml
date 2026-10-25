@@ -12,19 +12,30 @@ concurrency:
 
 jobs:
   backend:
-    name: Backend (Spring Boot, JDK 21)
+    name: Backend (Spring Boot, JDK 25)
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: backend
+    env:
+      # [bin] tests (TesseractCliIT, OcrPipelineIT real-engine cases) fail instead of
+      # being skipped when the binary is missing — CI must never go green on skips.
+      CI_REQUIRE_TESSERACT: 'true'
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 21
+      - name: Set up JDK 25
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '21'
+          java-version: '25'
+
+      - name: Install tesseract (eng + hin, same packs as the runtime image)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-eng tesseract-ocr-hin
+          tesseract --version
+          tesseract --list-langs
 
       - name: Cache Gradle
         uses: actions/cache@v4
@@ -42,12 +53,14 @@ jobs:
       - name: Integration tests (Testcontainers)
         run: ./gradlew :api-gateway:test --stacktrace
 
-      - name: Upload test reports
+      - name: Upload test + coverage reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: backend-test-reports
-          path: backend/**/build/reports/tests/
+          path: |
+            backend/**/build/reports/tests/
+            backend/**/build/reports/jacoco/
 
   web:
     name: Web (Angular)

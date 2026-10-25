@@ -7,6 +7,9 @@ import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.TimeUnit;
 
+import static org.junit.jupiter.api.Assertions.fail;
+import static org.junit.jupiter.api.Assumptions.assumeTrue;
+
 /**
  * Locates a real {@code tesseract} for the tests that genuinely need one.
  * Order: {@code TESSERACT_PATH} env, PATH, then the usual Homebrew / Debian
@@ -24,6 +27,30 @@ public final class TesseractBinary {
 
     public static boolean available() {
         return FOUND.isPresent();
+    }
+
+    public enum Gate { RUN, SKIP, FAIL }
+
+    /** Env var CI sets so a missing binary fails the build instead of quietly skipping {@code [bin]} tests. */
+    public static final String REQUIRE_ENV = "CI_REQUIRE_TESSERACT";
+
+    static Gate gate(boolean available, String requireEnv) {
+        if (available) return Gate.RUN;
+        return requireEnv != null && requireEnv.strip().equalsIgnoreCase("true") ? Gate.FAIL : Gate.SKIP;
+    }
+
+    /**
+     * For {@code @BeforeEach} of tests that need the real engine: runs them when
+     * tesseract is installed, skips them locally when it isn't, and fails when
+     * {@value #REQUIRE_ENV}=true (CI) — so CI can never go green on skipped tests.
+     */
+    public static void assumeAvailableOrFailInCi() {
+        switch (gate(available(), System.getenv(REQUIRE_ENV))) {
+            case RUN -> { }
+            case SKIP -> assumeTrue(false, "tesseract binary not installed — skipping real-engine test");
+            case FAIL -> fail(REQUIRE_ENV + "=true but no tesseract binary was found (PATH, TESSERACT_PATH, "
+                    + "/opt/homebrew/bin, /usr/local/bin, /usr/bin)");
+        }
     }
 
     private static Optional<String> locate() {

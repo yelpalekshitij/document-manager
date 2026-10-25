@@ -1,6 +1,6 @@
 import { Component, inject, output } from '@angular/core';
 
-import { DocumentsStore } from '../documents/documents.store';
+import { DocumentsStore, MAX_TAG_FILTER } from '../documents/documents.store';
 import { TagsStore } from './tags.store';
 
 /**
@@ -42,6 +42,7 @@ import { TagsStore } from './tags.store';
                 class="toggle"
                 [class.selected]="isSelected(t.id)"
                 [attr.aria-pressed]="isSelected(t.id)"
+                [disabled]="!isSelected(t.id) && atLimit()"
                 (click)="docs.toggleTag(t.id)"
               >
                 <span class="dot" aria-hidden="true" [style.background]="t.color ?? null"></span>
@@ -53,6 +54,9 @@ import { TagsStore } from './tags.store';
         </ul>
         @if (docs.selectedTagIds().length > 1) {
           <p class="hint">Showing documents with all selected tags.</p>
+        }
+        @if (atLimit()) {
+          <p class="hint limit" role="status">You can combine up to {{ maxTags }} tags. Deselect one to pick another.</p>
         }
       }
     </section>
@@ -80,6 +84,7 @@ import { TagsStore } from './tags.store';
       .toggle:hover { background: rgba(255, 255, 255, 0.03); }
       .toggle:focus-visible { outline: 2px solid var(--vd-accent); outline-offset: -2px; }
       .toggle.selected { background: rgba(88, 166, 255, 0.12); color: var(--vd-accent); }
+      .toggle:disabled { opacity: 0.45; cursor: not-allowed; }
       .dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--vd-fg-muted); flex: none; }
       .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .count { font-size: 0.72rem; color: var(--vd-fg-muted); }
@@ -101,7 +106,14 @@ export class TagFilterComponent {
     }
   }
 
+  protected readonly maxTags = MAX_TAG_FILTER;
+
   protected isSelected(id: string): boolean {
     return this.docs.selectedTagIds().includes(id);
+  }
+
+  /** The API rejects more than 20 filter ids, so further selections are disabled. */
+  protected atLimit(): boolean {
+    return this.docs.selectedTagIds().length >= MAX_TAG_FILTER;
   }
 }

@@ -8,12 +8,15 @@ import org.springframework.context.annotation.Configuration;
 import app.vaultdoc.catalog.domain.DocumentRepository;
 import app.vaultdoc.catalog.domain.DocumentTagRepository;
 import app.vaultdoc.catalog.domain.FolderRepository;
+import app.vaultdoc.catalog.domain.TagIndexResyncRepository;
 import app.vaultdoc.catalog.domain.TagRepository;
 import app.vaultdoc.catalog.service.DefaultFolderSeeder;
 import app.vaultdoc.catalog.service.DocumentService;
 import app.vaultdoc.catalog.service.DocumentServiceImpl;
 import app.vaultdoc.catalog.service.FolderService;
 import app.vaultdoc.catalog.service.FolderServiceImpl;
+import app.vaultdoc.catalog.service.TagIndexResyncQueue;
+import app.vaultdoc.catalog.service.TagIndexResyncQueueImpl;
 import app.vaultdoc.catalog.service.TagService;
 import app.vaultdoc.catalog.service.TagServiceImpl;
 
@@ -49,5 +52,11 @@ public class CatalogAutoConfiguration {
             DocumentRepository documents,
             ApplicationEventPublisher events) {
         return new TagServiceImpl(tags, documentTags, documents, events);
+    }
+
+    @Bean
+    @ConditionalOnMissingBean
+    TagIndexResyncQueue tagIndexResyncQueue(TagIndexResyncRepository repository) {
+        return new TagIndexResyncQueueImpl(repository);
     }
 }

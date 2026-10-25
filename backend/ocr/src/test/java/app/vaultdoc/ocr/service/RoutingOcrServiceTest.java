@@ -52,17 +52,53 @@ class RoutingOcrServiceTest {
     }
 
     @ParameterizedTest
+    @ValueSource(strings = {"Application/PDF;version=1.7", "APPLICATION/PDF", " application/pdf ", "application/pdf; charset=binary"})
+    void normalised_pdf_mime_routes_to_pdf_engine(String incoming) {
+        OcrResult done = OcrResult.done("t", 1);
+        when(pdf.extract(key, "application/pdf")).thenReturn(done);
+
+        assertThat(router.extract(key, incoming)).isSameAs(done);
+        verify(image, never()).extract(any(), anyString());
+    }
+
+    @ParameterizedTest
     @CsvSource(delimiter = '|', value = {
             "IMAGE/PNG | image/png",
             "' image/png ; q=1' | image/png",
-            "Application/PDF;version=1.7 | application/pdf",
+            "Image/JPEG | image/jpeg",
+            "' IMAGE/TIFF ' | image/tiff",
     })
-    void normalises_mime_casing_whitespace_and_parameters(String incoming, String delegated) {
+    void normalised_image_mime_routes_to_image_engine(String incoming, String delegated) {
         OcrResult done = OcrResult.done("t", 1);
         when(image.extract(key, delegated)).thenReturn(done);
-        when(pdf.extract(key, delegated)).thenReturn(done);
 
         assertThat(router.extract(key, incoming)).isSameAs(done);
+        verify(pdf, never()).extract(any(), anyString());
+    }
+
+    @ParameterizedTest
+    @CsvSource({
+            "image/x-png, image/png",
+            "image/pjpeg, image/jpeg",
+            "image/tif, image/tiff",
+            "image/x-tiff, image/tiff",
+    })
+    void routes_common_mime_aliases(String alias, String canonical) {
+        OcrResult done = OcrResult.done("t", 1);
+        when(image.extract(key, canonical)).thenReturn(done);
+
+        assertThat(router.extract(key, alias)).isSameAs(done);
+        verify(pdf, never()).extract(any(), anyString());
+    }
+
+    @Test
+    void engine_out_of_memory_is_failed_not_propagated() {
+        when(pdf.extract(key, "application/pdf")).thenThrow(new OutOfMemoryError("Java heap space"));
+
+        OcrResult result = router.extract(key, "application/pdf");
+
+        assertThat(result.status()).isEqualTo(OcrStatus.FAILED);
+        assertThat(result.failureReason()).containsIgnoringCase("memory");
     }
 
     @ParameterizedTest
